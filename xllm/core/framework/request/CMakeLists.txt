@@ -75,6 +75,7 @@ cc_library(
     proto::xllm_proto
     torch
     ${OpenCV_LIBS}
+    ${FFMPEG_LIBRARIES}
 )
 
 cc_test(

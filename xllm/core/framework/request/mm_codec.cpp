@@ -665,7 +665,8 @@ class MemoryMediaWriter {
             int32_t width,
             int32_t height,
             double fps,
-            AVPixelFormat pix_fmt) {
+            AVPixelFormat pix_fmt,
+            AVDictionary** opts = nullptr) {
     const AVCodec* codec = avcodec_find_encoder(codec_id);
     if (!codec) {
       LOG(ERROR) << "MemoryMediaWriter: encoder not found, codec_id="
@@ -721,7 +722,7 @@ class MemoryMediaWriter {
       codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    if (avcodec_open2(codec_ctx_, codec, nullptr) < 0) {
+    if (avcodec_open2(codec_ctx_, codec, opts) < 0) {
       LOG(ERROR) << "MemoryMediaWriter: avcodec_open2 failed for "
                  << codec->name;
       return false;
@@ -835,12 +836,28 @@ class MemoryVideoWriter : public MemoryMediaWriter {
 
     AVCodecID codec_id;
     AVPixelFormat pix_fmt;
+    AVDictionary* opts = nullptr;
+
     if (format == "avi") {
       codec_id = AV_CODEC_ID_MJPEG;
       pix_fmt = AV_PIX_FMT_YUVJ420P;
     } else {
-      codec_id = AV_CODEC_ID_MPEG4;
-      pix_fmt = AV_PIX_FMT_YUV420P;
+      const AVCodec* x264_codec = avcodec_find_encoder_by_name("libx264");
+
+      if (x264_codec) {
+        codec_id = x264_codec->id;
+        pix_fmt = AV_PIX_FMT_YUV420P;
+        av_dict_set(&opts, "crf", "18", 0);
+        av_dict_set(&opts, "preset", "medium", 0);
+        av_dict_set(&opts, "profile", "high", 0);
+        av_dict_set(&opts, "level", "4.1", 0);
+        LOG(INFO) << "Using libx264 H.264 encoder with CRF=18";
+      } else {
+        codec_id = AV_CODEC_ID_MPEG4;
+        pix_fmt = AV_PIX_FMT_YUV420P;
+        av_dict_set(&opts, "mbd", "2", 0);
+        LOG(WARNING) << "libx264 not available, using MPEG4 fallback";
+      }
     }
 
     if (!init(format.c_str(),
@@ -848,9 +865,12 @@ class MemoryVideoWriter : public MemoryMediaWriter {
               static_cast<int32_t>(W),
               static_cast<int32_t>(H),
               fps,
-              pix_fmt)) {
+              pix_fmt,
+              &opts)) {
+      if (opts) av_dict_free(&opts);
       return false;
     }
+    if (opts) av_dict_free(&opts);
 
     sws_ctx_ = sws_getContext(static_cast<int32_t>(W),
                               static_cast<int32_t>(H),

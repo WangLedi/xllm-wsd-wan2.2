@@ -938,12 +938,8 @@ class WanTimeTextImageEmbeddingImpl : public torch::nn::Module {
     } else {
       timestep_proj_out = timestep_proj_out.view({-1, 6, dim_});
     }
-    LOG(INFO) << "[DIAG_EMBED] timestep_proj_out dtype="
-              << timestep_proj_out.dtype()
-              << " shape=" << timestep_proj_out.sizes();
 
     torch::Tensor text_emb = text_embedder_->forward(encoder_hidden_states);
-    LOG(INFO) << "[DIAG_EMBED] text_emb dtype=" << text_emb.dtype();
 
     torch::Tensor image_emb;
     if (image_embedder_ && encoder_hidden_states_image.defined()) {
@@ -1009,8 +1005,6 @@ class WanRotaryPosEmbedImpl : public torch::nn::Module {
     compute_freqs();
   }
 
-  // [ROPE_FIX] FP32 restore: getter/setter for freqs (public for external
-  // access)
   torch::Tensor get_freqs_cos() const { return freqs_cos_; }
   torch::Tensor get_freqs_sin() const { return freqs_sin_; }
   void set_freqs_cos(const torch::Tensor& t) { freqs_cos_ = t; }
@@ -1192,13 +1186,10 @@ class WanTransformerBlockImpl : public torch::nn::Module {
     }
 
     torch::Tensor norm1_result = norm1_->forward(hidden_states);
-
     torch::Tensor norm_hidden_states =
         (norm1_result.to(hidden_states.dtype()) * (1 + scale_msa) + shift_msa);
-
     torch::Tensor attn_output =
         attn1_->forward(norm_hidden_states, norm_hidden_states, rotary_emb);
-
     hidden_states = hidden_states + attn_output * gate_msa;
 
     if (cross_attn_norm_) {
@@ -1209,15 +1200,10 @@ class WanTransformerBlockImpl : public torch::nn::Module {
 
     attn_output = attn2_->forward(
         norm_hidden_states, encoder_hidden_states, std::nullopt);
-
     hidden_states = hidden_states + attn_output;
-
     torch::Tensor norm2_result = norm3_->forward(hidden_states);
-
     norm_hidden_states = (norm2_result * (1 + c_scale_msa) + c_shift_msa);
-
     torch::Tensor ff_output = ff_->forward(norm_hidden_states);
-
     hidden_states = hidden_states + ff_output * c_gate_msa;
 
     return hidden_states;

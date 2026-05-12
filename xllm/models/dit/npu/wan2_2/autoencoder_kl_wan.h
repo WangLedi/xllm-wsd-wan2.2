@@ -17,7 +17,6 @@
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/state_dict/state_dict.h"
-// #include "../../dit_linear.h"
 #include "framework/model_context.h"
 #include "models/model_registry.h"
 #include "processors/input_processor.h"
@@ -151,16 +150,14 @@ class WanCausalConv3DImpl : public torch::nn::Module {
         kernel_size_(kernel_size),
         stride_(stride),
         padding_(padding) {
-    LOG(INFO) << "构建了一个Conv3D模块";
     conv_ = register_module(
         "conv",
         torch::nn::Conv3d(
             torch::nn::Conv3dOptions(in_channels, out_channels, kernel_size)
                 .stride(stride)
-                .padding(0)
+                .padding({0, padding[1], padding[2]})
                 .bias(true)));
-    _padding_ = {
-        padding[2], padding[2], padding[1], padding[1], 2 * padding[0], 0};
+    _padding_ = {0, 0, 0, 0, 2 * padding[0], 0};
   }
 
   torch::Tensor forward(
@@ -348,7 +345,6 @@ class WanResampleImpl : public torch::nn::Module {
       std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
 
-    LOG(INFO) << "------------------Resample1----------------------";
     auto sizes = x.sizes();
     int64_t b = sizes[0], c = sizes[1], t = sizes[2], h = sizes[3],
             w = sizes[4];
@@ -356,12 +352,9 @@ class WanResampleImpl : public torch::nn::Module {
     if (mode_ == "upsample3d" && feat_cache) {
       int64_t idx = (*feat_idx)[0];
       if ((*feat_cache)[idx].numel() == 0) {
-        LOG(INFO) << "------------------Resample2----------------------";
         feat_cache->at(idx) = rep_tensor_;
         (*feat_idx)[0]++;  // Filling Rep flag
-        LOG(INFO) << "------------------Resample3----------------------";
       } else {
-        LOG(INFO) << "------------------Resample4----------------------";
         auto cache_x =
             x.index({torch::indexing::Slice(),
                      torch::indexing::Slice(),
@@ -369,12 +362,8 @@ class WanResampleImpl : public torch::nn::Module {
                      torch::indexing::Slice(),
                      torch::indexing::Slice()})
                 .clone();
-        LOG(INFO) << "------------------Resample5----------------------";
-        LOG(INFO) << "cache_x 的shape是：" << cache_x.sizes();
-        LOG(INFO) << "feat_cache此时元素的值是：" << cache_x.sizes();
         if (cache_x.size(2) < 2 && (*feat_cache)[idx].numel() > 0 &&
             !torch::equal(rep_tensor_, feat_cache->at(idx))) {
-          LOG(INFO) << "------------------Resample6----------------------";
           cache_x = torch::cat({(*feat_cache)[idx]
                                     .index({torch::indexing::Slice(),
                                             torch::indexing::Slice(),
@@ -386,28 +375,20 @@ class WanResampleImpl : public torch::nn::Module {
                                 cache_x},
                                2);
         }
-        LOG(INFO) << "------------------Resample7----------------------";
         if (cache_x.size(2) < 2 && (*feat_cache)[idx].numel() > 0 &&
             torch::equal(rep_tensor_, feat_cache->at(idx))) {
-          LOG(INFO) << "------------------Resample8----------------------";
           cache_x = torch::cat(
               {torch::zeros_like(cache_x).to(cache_x.device()), cache_x}, 2);
         }
-        LOG(INFO) << "------------------Resample9----------------------";
         if (torch::equal(rep_tensor_, feat_cache->at(idx))) {
-          LOG(INFO) << "------------------Resample10----------------------";
           x = time_conv_->forward(x);
-          LOG(INFO) << "------------------Resample11----------------------";
         } else {
-          LOG(INFO) << "------------------Resample12----------------------";
           x = time_conv_->forward(x, (*feat_cache)[idx]);
-          LOG(INFO) << "------------------Resample13----------------------";
         }
         (*feat_cache)[idx] = cache_x;
         (*feat_idx)[0] += 1;
 
         x = x.view({b, 2, c, t, h, w});
-        LOG(INFO) << "------------------Resample14----------------------";
         x = torch::stack({x.index({torch::indexing::Slice(),
                                    0,
                                    torch::indexing::Slice(),
@@ -421,24 +402,15 @@ class WanResampleImpl : public torch::nn::Module {
                                    torch::indexing::Slice(),
                                    torch::indexing::Slice()})},
                          3);
-        LOG(INFO) << "------------------Resample15----------------------";
         x = x.view({b, c, t * 2, h, w});
-        LOG(INFO) << "------------------Resample16----------------------";
       }
     }
     t = x.size(2);
-    LOG(INFO) << "------------------Resample17----------------------";
     x = x.permute({0, 2, 1, 3, 4}).reshape({b * t, c, h, w});
-    LOG(INFO) << "------------------Resample18----------------------";
 
-    LOG(INFO) << "WanResample mode=" << mode_
-              << " pre-resample shape: " << x.sizes();
-    LOG(INFO) << "------------------Resample19----------------------";
     x = resample_->forward(x);
-    LOG(INFO) << "------------------Resample20----------------------";
     x = x.view({b, t, x.size(1), x.size(2), x.size(3)})
             .permute({0, 2, 1, 3, 4});
-    LOG(INFO) << "------------------Resample21----------------------";
 
     if (mode_ == "downsample3d" && feat_cache) {
       int idx = (*feat_idx)[0];
@@ -547,24 +519,16 @@ class WanResidualBlockImpl : public torch::nn::Module {
 
     torch::Tensor h;
     if (in_dim_ != out_dim_) {
-      LOG(INFO) << "————————————————————RES1————————————————————————";
       h = conv_shortcut_->forward(x);
-      LOG(INFO) << "————————————————————RES2————————————————————————";
     } else {
-      LOG(INFO) << "————————————————————RES3————————————————————————";
       h = x;
-      LOG(INFO) << "————————————————————RES4————————————————————————";
     }
 
-    LOG(INFO) << "————————————————————RES5————————————————————————";
     x = norm1_->forward(x);
-    LOG(INFO) << "————————————————————RES6————————————————————————";
     x = nonlinearity_(x);
-    LOG(INFO) << "————————————————————RES7————————————————————————";
 
     if (feat_cache) {
       int64_t idx = (*feat_idx)[0];
-      LOG(INFO) << "————————————————————RES8————————————————————————";
       auto cache_x =
           x.index({torch::indexing::Slice(),
                    torch::indexing::Slice(),
@@ -572,9 +536,7 @@ class WanResidualBlockImpl : public torch::nn::Module {
                    torch::indexing::Slice(),
                    torch::indexing::Slice()})
               .clone();
-      LOG(INFO) << "————————————————————RES9————————————————————————";
       if (cache_x.size(2) < 2 && (*feat_cache)[idx].numel() > 0) {
-        LOG(INFO) << "————————————————————RES10————————————————————————";
         cache_x = torch::cat({(*feat_cache)[idx]
                                   .index({torch::indexing::Slice(),
                                           torch::indexing::Slice(),
@@ -585,31 +547,20 @@ class WanResidualBlockImpl : public torch::nn::Module {
                                   .to(cache_x.device()),
                               cache_x},
                              2);
-        LOG(INFO) << "————————————————————RES11————————————————————————";
       }
-      LOG(INFO) << "————————————————————RES12————————————————————————";
       x = conv1_->forward(x, (*feat_cache)[idx]);
-      LOG(INFO) << "————————————————————RES13————————————————————————";
       (*feat_cache)[idx] = cache_x;
-      LOG(INFO) << "————————————————————RES14————————————————————————";
       (*feat_idx)[0] += 1;
     } else {
-      LOG(INFO) << "————————————————————RES15————————————————————————";
       x = conv1_->forward(x);
-      LOG(INFO) << "————————————————————RES16————————————————————————";
     }
 
-    LOG(INFO) << "————————————————————RES17————————————————————————";
     x = norm2_->forward(x);
-    LOG(INFO) << "————————————————————RES18————————————————————————";
     x = nonlinearity_(x);
-    LOG(INFO) << "————————————————————RES19————————————————————————";
     x = dropout_layer_->forward(x);
-    LOG(INFO) << "————————————————————RES20————————————————————————";
 
     if (feat_cache) {
       int idx = (*feat_idx)[0];
-      LOG(INFO) << "————————————————————RES21————————————————————————";
       auto cache_x =
           x.index({torch::indexing::Slice(),
                    torch::indexing::Slice(),
@@ -618,10 +569,6 @@ class WanResidualBlockImpl : public torch::nn::Module {
                    torch::indexing::Slice()})
               .clone();
 
-      LOG(INFO) << "cache_x 的shape是：" << cache_x.sizes();
-      LOG(INFO) << "idx的值是：" << idx;
-      LOG(INFO) << "feat_cache数组的大小是：" << (*feat_cache).size();
-      LOG(INFO) << "————————————————————RES22————————————————————————";
       if (cache_x.size(2) < 2 && idx < feat_cache->size() &&
           (*feat_cache)[idx].numel()) {
         cache_x = torch::cat({(*feat_cache)[idx]
@@ -635,17 +582,11 @@ class WanResidualBlockImpl : public torch::nn::Module {
                               cache_x},
                              2);
       }
-      LOG(INFO) << "————————————————————RES23————————————————————————";
       x = conv2_->forward(x, (*feat_cache)[idx]);
-      LOG(INFO) << "————————————————————RES24————————————————————————";
       (*feat_cache)[idx] = cache_x;
-      LOG(INFO) << "————————————————————RES25————————————————————————";
       (*feat_idx)[0] += 1;
-      LOG(INFO) << "————————————————————RES26————————————————————————";
     } else {
-      LOG(INFO) << "————————————————————RES27————————————————————————";
       x = conv2_->forward(x);
-      LOG(INFO) << "————————————————————RES28————————————————————————";
     }
 
     return x + h;
@@ -674,8 +615,9 @@ class WanResidualBlockImpl : public torch::nn::Module {
 
  private:
   int64_t in_dim_, out_dim_;
-  // std::string non_linearity_;
   const int CACHE_T = 2;
+
+ public:
   torch::nn::Functional nonlinearity_{nullptr};
   WanRMSNorm norm1_{nullptr}, norm2_{nullptr};
   WanCausalConv3D conv1_{nullptr}, conv2_{nullptr}, conv_shortcut_{nullptr};
@@ -835,6 +777,8 @@ class WanMidBlockImpl : public torch::nn::Module {
 
  private:
   int64_t dim_;
+
+ public:
   torch::nn::ModuleList resnets_{nullptr};
   torch::nn::ModuleList attentions_{nullptr};
 };
@@ -990,8 +934,6 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
       std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
-    LOG(INFO) << "————————————————————VAEEncoder1————————————————————————";
-
     if (feat_cache) {
       int64_t idx = (*feat_idx)[0];
       auto cache_x =
@@ -1013,21 +955,13 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
                               cache_x},
                              2);
       }
-      LOG(INFO) << "————————————————————VAEEncoder2————————————————————————";
       x = conv_in_->forward(x, (*feat_cache)[idx]);
-      LOG(INFO) << "————————————————————VAEEncoder3————————————————————————";
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      LOG(INFO) << "————————————————————VAEEncoder4————————————————————————";
       x = conv_in_->forward(x);
     }
-    LOG(INFO) << "————————————————————VAEEncoder5————————————————————————";
-    // wsd
-    torch::save(x, "/home/weinan5/zjs/tensors_save_dir/cpp/wsd_x_conv1_cpp.pt");
 
-    LOG(INFO)
-        << "~~~~ ~~~ ~~~~ ~~~~~~~ ~~~~~~~ ~~~~~ ~~~~~~~~ ~~~~~~~~ ~~~`~ ~~~~";
     // Type-safe forward call for down_blocks_
     for (size_t i = 0; i < down_blocks_->size(); ++i) {
       if (auto res_down = down_blocks_[i]->as<WanResidualDownBlock>()) {
@@ -1042,14 +976,8 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
                        : resample->forward(x);
       }
     }
-    // wsd
-    torch::save(
-        x, "/home/weinan5/zjs/tensors_save_dir/cpp/wsd_x_downsamlpes_cpp.pt");
 
     x = mid_block_->forward(x, feat_cache, feat_idx);
-    // wsd
-    torch::save(x,
-                "/home/weinan5/zjs/tensors_save_dir/cpp/wsd_x_middle_cpp.pt");
     x = norm_out_->forward(x);
     x = nonlinearity_(x);
     if (feat_cache) {
@@ -1075,13 +1003,10 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
       }
       x = conv_out_->forward(x, (*feat_cache)[idx]);
       (*feat_cache)[idx] = cache_x;
-      LOG(INFO) << "feat_idx[0]的值为：" << (*feat_idx)[0];
       (*feat_idx)[0] += 1;
     } else {
       x = conv_out_->forward(x);
     }
-    // wsd
-    torch::save(x, "/home/weinan5/zjs/tensors_save_dir/cpp/wsd_x_head_cpp.pt");
     return x;
   }
 
@@ -1260,34 +1185,22 @@ class WanUpBlockImpl : public torch::nn::Module {
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
       std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
-    LOG(INFO) << "————————————————————UP1————————————————————————";
 
     torch::Tensor h = x;
     for (size_t i = 0; i < resnets_->size(); ++i) {
-      LOG(INFO) << "————————————————————UP2————————————————————————";
       auto resnet = resnets_[i]->as<WanResidualBlock>();
       if (feat_cache) {
-        LOG(INFO) << "————————————————————UP3————————————————————————";
         h = resnet->forward(h, feat_cache, feat_idx);
-        LOG(INFO) << "————————————————————UP4———————————————————————";
       } else {
-        LOG(INFO) << "————————————————————UP5————————————————————————";
         h = resnet->forward(h);
-        LOG(INFO) << "————————————————————UP6————————————————————————";
       }
     }
-    LOG(INFO) << "————————————————————UP7————————————————————————";
     if (upsamplers_ && upsamplers_->size() > 0) {
-      LOG(INFO) << "————————————————————UP8————————————————————————";
       auto upsampler = upsamplers_[0]->as<WanResample>();
       if (feat_cache) {
-        LOG(INFO) << "————————————————————UP9————————————————————————";
         h = upsampler->forward(h, feat_cache, feat_idx);
-        LOG(INFO) << "————————————————————UP10————————————————————————";
       } else {
-        LOG(INFO) << "————————————————————UP11————————————————————————";
         h = upsampler->forward(h);
-        LOG(INFO) << "————————————————————UP12————————————————————————";
       }
     }
     return h;
@@ -1409,7 +1322,6 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
     // conv_in
     if (feat_cache) {
       int64_t idx = (*feat_idx)[0];
-      LOG(INFO) << "————————————————————VAEDecoder1————————————————————————";
       torch::Tensor cache_x =
           x.index({torch::indexing::Slice(),
                    torch::indexing::Slice(),
@@ -1417,8 +1329,6 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
                    torch::indexing::Slice(),
                    torch::indexing::Slice()})
               .clone();
-      LOG(INFO) << "————————————————————VAEDecoder2————————————————————————";
-      LOG(INFO) << "cache_x 的shape是：" << cache_x.sizes();
       if (cache_x.size(2) < 2 && (*feat_cache)[idx].defined()) {
         cache_x = torch::cat({(*feat_cache)[idx]
                                   .index({torch::indexing::Slice(),
@@ -1431,19 +1341,15 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
                               cache_x},
                              2);
       }
-      LOG(INFO) << "————————————————————VAEDecoder3————————————————————————";
       x = conv_in_->forward(x, (*feat_cache)[idx]);
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      LOG(INFO) << "————————————————————VAEDecoder4————————————————————————";
       x = conv_in_->forward(x);
     }
-    LOG(INFO) << "————————————————————VAEDecoder5————————————————————————";
 
     // mid_block
     x = mid_block_->forward(x, feat_cache, feat_idx);
-    LOG(INFO) << "————————————————————VAEDecoder6————————————————————————";
 
     // up_blocks : pass 'first_chunk'  to WanResidualUpBlock
     for (size_t i = 0; i < up_blocks_->size(); ++i) {
@@ -1453,12 +1359,9 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
         x = up->forward(x, feat_cache, feat_idx);
       }
     }
-    LOG(INFO) << "————————————————————VAEDecoder7————————————————————————";
 
     x = norm_out_->forward(x);
-    LOG(INFO) << "————————————————————VAEDecoder8————————————————————————";
     x = nonlinearity_(x);
-    LOG(INFO) << "————————————————————VAEDecoder9————————————————————————";
 
     // conv_out
     if (feat_cache) {
@@ -1483,28 +1386,24 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
              cache_x},
             2);
       }
-      LOG(INFO) << "————————————————————VAEDecoder10————————————————————————";
       x = conv_out_->forward(x, (*feat_cache)[idx]);
-      LOG(INFO) << "————————————————————VAEDecoder11————————————————————————";
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      LOG(INFO) << "————————————————————VAEDecoder12————————————————————————";
       x = conv_out_->forward(x);
     }
+    torch::save(x,
+                "/home/weinan5/zjs/tensors_save_dir/cpp/wsd_dec_x_head_cpp.pt");
     return x;
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    LOG(INFO) << "Decoder::load_state_dict, up_blocks count="
-              << up_blocks_->size();
     conv_in_->load_state_dict(state_dict.get_dict_with_prefix("conv_in."));
     mid_block_->load_state_dict(state_dict.get_dict_with_prefix("mid_block."));
 
     // Safely load weights of up_blocks :
     for (size_t i = 0; i < up_blocks_->size(); ++i) {
       std::string prefix = "up_blocks." + std::to_string(i) + ".";
-      LOG(INFO) << "Loading up_block[" << i << "]...";
 
       if (up_blocks_[i]->as<WanResidualUpBlock>()) {
         up_blocks_[i]->as<WanResidualUpBlock>()->load_state_dict(
@@ -1514,7 +1413,6 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
             state_dict.get_dict_with_prefix(prefix));
       }
     }
-    LOG(INFO) << "Loading norm_out and conv_out...";
     norm_out_->load_state_dict(state_dict.get_dict_with_prefix("norm_out."));
     conv_out_->load_state_dict(state_dict.get_dict_with_prefix("conv_out."));
   }
@@ -1596,11 +1494,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
         WanCausalConv3D(
             args_.z_dim(), args_.z_dim(), std::vector<int64_t>{1, 1, 1}));
     init_cached_conv_count();
-
-    // encoder_->to(dtype_);
-    // decoder_->to(dtype_);
-    // quant_conv_->to(dtype_);
-    // post_quant_conv_->to(dtype_);
   }
 
   void enable_slicing(bool enable) { use_slicing_ = enable; }
@@ -1608,13 +1501,11 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
 
   void clear_cache() {
     conv_num_ = cached_conv_count_["decoder"];
-    LOG(INFO) << "decoder中初始化缓存数组大小为：" << conv_num_;
     conv_idx_ = std::make_shared<std::vector<int64_t>>(std::vector<int64_t>{0});
     feat_map_ = std::make_shared<std::vector<torch::Tensor>>(
         std::vector<torch::Tensor>(conv_num_));
 
     enc_conv_num_ = cached_conv_count_["encoder"];
-    LOG(INFO) << "encoder中初始化缓存数组大小为：" << enc_conv_num_;
     enc_conv_idx_ =
         std::make_shared<std::vector<int64_t>>(std::vector<int64_t>{0});
     enc_feat_map_ = std::make_shared<std::vector<torch::Tensor>>(
@@ -1623,48 +1514,45 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
 
   // Encode video into latent representations
   torch::Tensor encode_(const torch::Tensor& videos) {
-    int64_t num_frame = videos.size(2);
-    int64_t height = videos.size(3);
-    int64_t width = videos.size(4);
+    auto orig_dtype = videos.dtype();
+    auto x = videos.to(torch::kFloat32);
+    int64_t num_frame = x.size(2);
+    int64_t height = x.size(3);
+    int64_t width = x.size(4);
     int64_t iter_ = 1 + (num_frame - 1) / 4;
     clear_cache();
     torch::Tensor out;
-    LOG(INFO) << "————————————————————进入VAE encode_————————————————————————";
-
     feat_map_ = std::make_shared<std::vector<torch::Tensor>>(
         std::vector<torch::Tensor>(conv_num_));
 
     for (int64_t i = 0; i < iter_; ++i) {
       enc_conv_idx_ = {0};
       if (i == 0) {
-        auto x_slice = videos.index({torch::indexing::Slice(),
-                                     torch::indexing::Slice(),
-                                     torch::indexing::Slice(0, 1),
-                                     torch::indexing::Slice(),
-                                     torch::indexing::Slice()});
-        LOG(INFO)
-            << "————————————————————进入VAE encoder————————————————————————";
+        auto x_slice = x.index({torch::indexing::Slice(),
+                                torch::indexing::Slice(),
+                                torch::indexing::Slice(0, 1),
+                                torch::indexing::Slice(),
+                                torch::indexing::Slice()});
         out = encoder_(x_slice, enc_feat_map_, enc_conv_idx_);
       } else {
         int64_t start = 1 + 4 * (i - 1);
         int64_t end = std::min(1 + 4 * i, num_frame);
-        auto x_slice = videos.index({torch::indexing::Slice(),
-                                     torch::indexing::Slice(),
-                                     torch::indexing::Slice(start, end),
-                                     torch::indexing::Slice(),
-                                     torch::indexing::Slice()});
+        auto x_slice = x.index({torch::indexing::Slice(),
+                                torch::indexing::Slice(),
+                                torch::indexing::Slice(start, end),
+                                torch::indexing::Slice(),
+                                torch::indexing::Slice()});
         auto out_ = encoder_(x_slice, enc_feat_map_, enc_conv_idx_);
         out = torch::cat({out, out_}, 2);
       }
     }
     out = quant_conv_(out);
     clear_cache();
-    return out;
+    return out.to(orig_dtype);
   }
 
   AutoencoderKLOutput encode(const torch::Tensor& videos) {
     torch::Tensor hidden_states;
-    LOG(INFO) << "————————————————————进入VAE encode————————————————————————";
     if (use_slicing_) {
       std::vector<torch::Tensor> latent_slices;
       for (const auto& x_slice : videos.split(1)) {
@@ -1680,14 +1568,17 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
 
   // Decode latent representations into videos
   DecoderOutput decode_(const torch::Tensor& latents) {
-    torch::Tensor processed_latents = latents;
-    int64_t num_frame = latents.size(2);
-    int64_t height = latents.size(3);
-    int64_t width = latents.size(4);
+    auto orig_dtype = latents.dtype();
+    torch::Tensor processed_latents = latents.to(torch::kFloat32);
+    int64_t num_frame = processed_latents.size(2);
+    int64_t height = processed_latents.size(3);
+    int64_t width = processed_latents.size(4);
     clear_cache();
     torch::Tensor out;
     processed_latents = post_quant_conv_(processed_latents);
-    LOG(INFO) << "待解码latents的shape是：" << processed_latents.sizes();
+    torch::save(processed_latents.contiguous().to(torch::kFloat32).cpu(),
+                "/home/weinan5/zjs/tensors_save_dir/cpp/"
+                "wsd_dec_after_post_quant_conv_cpp.pt");
     for (int64_t i = 0; i < num_frame; ++i) {
       conv_idx_ = {0};
       if (i == 0) {
@@ -1705,14 +1596,14 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
                                      torch::indexing::Slice(i, i + 1),
                                      torch::indexing::Slice(),
                                      torch::indexing::Slice()});
-        LOG(INFO) << "现在decoder处理到了的帧次序是：" << i + 1;
         auto out_ = decoder_(x_slice, feat_map_, conv_idx_);
         out = torch::cat({out, out_}, 2);
       }
     }
     auto dec = torch::clamp(out, -1.0f, 1.0f);
+
     clear_cache();
-    return DecoderOutput(dec);
+    return DecoderOutput(dec.to(orig_dtype));
   }
 
   DecoderOutput decode(
@@ -1746,6 +1637,16 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
 
   void load_model(std::unique_ptr<DiTFolderLoader> loader) {
     LOG(INFO) << "AutoencoderKLWan::load_model starting";
+    // Convert parameter tensors to FP32 BEFORE loading weights.
+    // load_weight() does weight.copy_(tensor) which quantizes FP32
+    // checkpoint data into the parameter's dtype. If parameters are
+    // BF16 (NPU default), precision is lost during copy_. Converting
+    // to FP32 first preserves the full FP32 checkpoint precision.
+    encoder_->to(torch::kFloat32);
+    decoder_->to(torch::kFloat32);
+    quant_conv_->to(torch::kFloat32);
+    post_quant_conv_->to(torch::kFloat32);
+
     for (const auto& state_dict : loader->get_state_dicts()) {
       LOG(INFO) << "Loading encoder weights...";
       encoder_->load_state_dict(state_dict->get_dict_with_prefix("encoder."));
@@ -1760,6 +1661,19 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
     }
     LOG(INFO) << "Verifying weights...";
     verify_loaded_weights("");
+    // Diagnostic: print weight dtype to verify FP32 conversion worked
+    for (const auto& p : encoder_->parameters()) {
+      LOG(INFO) << "[VAE_DTYPE] encoder param dtype=" << p.dtype();
+      break;
+    }
+    for (const auto& p : decoder_->parameters()) {
+      LOG(INFO) << "[VAE_DTYPE] decoder param dtype=" << p.dtype();
+      break;
+    }
+    for (const auto& p : quant_conv_->parameters()) {
+      LOG(INFO) << "[VAE_DTYPE] quant_conv param dtype=" << p.dtype();
+      break;
+    }
     LOG(INFO) << "WANVAE::load_model complete";
   }
 
@@ -1799,7 +1713,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
     if (decoder_) {
       for (const auto& m : decoder_->modules(/*include_self=*/false)) {
         if (dynamic_cast<WanCausalConv3DImpl*>(m.get()) != nullptr) {
-          LOG(INFO) << "decoder_count的值为：" << decoder_count;
           ++decoder_count;
         }
       }
@@ -1807,7 +1720,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
     if (encoder_) {
       for (const auto& m : encoder_->modules(/*include_self=*/false)) {
         if (dynamic_cast<WanCausalConv3DImpl*>(m.get()) != nullptr) {
-          LOG(INFO) << "encoder_count的值为：" << encoder_count;
           ++encoder_count;
         }
       }

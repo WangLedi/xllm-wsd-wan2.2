@@ -1,3 +1,18 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 #pragma once
 #include <torch/torch.h>
 
@@ -6,7 +21,6 @@
 #include <iostream>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -22,30 +36,12 @@
 #include "xllm/core/layers/common/add_matmul.h"
 
 namespace xllm {
-// UMT5 model compatible with huggingface weights
-// ref to:
-// https://github.com/huggingface/transformers/tree/main/src/transformers/models/umt5
-class UMT5LayerNormImpl : public torch::nn::Module {
+class UMT5LayerNormImpl : public T5LayerNormImpl {
  public:
-  explicit UMT5LayerNormImpl(ModelContext context, bool is_save = false)
-      : device_(context.get_tensor_options().device()),
-        dtype_(context.get_tensor_options().dtype().toScalarType()) {
-    ModelArgs model_args = context.get_model_args();
-    int64_t hidden_size = model_args.d_model();
-    variance_epsilon_ = model_args.layer_norm_eps();
-    is_save_ = is_save;
-    weight_ = register_parameter(
-        "weight", torch::ones({hidden_size}).to(device_).to(dtype_));
-  }
+  using T5LayerNormImpl::T5LayerNormImpl;
 
   torch::Tensor forward(torch::Tensor hidden_states) {
-    if (is_save_) {
-      torch::save(
-          weight_,
-          "/home/weinan5/zjs/tensors_save_dir/cpp/rmsnorm_weight_cpp.pt");
-    }
     auto variance = hidden_states.to(torch::kFloat32).pow(2).mean(-1, true);
-    LOG(INFO) << "zhubowei variance_epsilon_" << variance_epsilon_;
     hidden_states = hidden_states * torch::rsqrt(variance + variance_epsilon_);
     if (weight_.dtype() == torch::kFloat16 ||
         weight_.dtype() == torch::kBFloat16) {
@@ -53,165 +49,22 @@ class UMT5LayerNormImpl : public torch::nn::Module {
     }
     return weight_ * hidden_states;
   }
-
-  void load_state_dict(const StateDict& state_dict) {
-    // LOAD_WEIGHT(weight);
-    if (state_dict.has("weight")) {
-      xllm::weight::load_weight(
-          state_dict, "weight", weight_, weight_is_loaded_);
-    }
-  }
-
-  void verify_loaded_weights(const std::string& prefix) const {
-    CHECK(weight_is_loaded_)
-        << "weight is not loaded for " << prefix + "weight";
-  }
-
- private:
-  torch::Tensor weight_;
-  bool weight_is_loaded_ = false;
-  double variance_epsilon_;
-  torch::Device device_;
-  torch::ScalarType dtype_;
-  bool is_save_;
 };
 TORCH_MODULE(UMT5LayerNorm);
 
-#ifndef GELU_NEW_DEFINED
-#define GELU_NEW_DEFINED
-torch::Tensor umt5_gelu_new(const torch::Tensor& x) {
-  const double sqrt_2_over_pi = std::sqrt(2.0 / M_PI);
-  return 0.5 * x *
-         (1.0 +
-          torch::tanh(sqrt_2_over_pi * (x + 0.044715 * torch::pow(x, 3))));
-}
-#endif
-
-class UMT5DenseInterface : public torch::nn::Module {
- public:
-  virtual torch::Tensor forward(const torch::Tensor& hidden_states) = 0;
-  virtual void load_state_dict(const StateDict& state_dict) = 0;
-  virtual void verify_loaded_weights(const std::string& prefix) const = 0;
-};
-
-class UMT5DenseActDenseImpl : public UMT5DenseInterface {
- public:
-  explicit UMT5DenseActDenseImpl(const ModelContext& context) {
-    auto model_args = context.get_model_args();
-    auto options = context.get_tensor_options();
-    wi_ = register_module(
-        "wi",
-        layer::AddMatmul(
-            model_args.d_model(), model_args.d_ff(), false, options));
-    wo_ = register_module(
-        "wo",
-        layer::AddMatmul(
-            model_args.d_ff(), model_args.d_model(), false, options));
-
-    if (model_args.act_fn() == "relu") {
-      act_ = register_module("act", torch::nn::Functional(torch::relu));
-    } else if (model_args.act_fn() == "gelu_new") {
-      act_ = register_module("act", torch::nn::Functional(umt5_gelu_new));
-    } else {
-      LOG(FATAL) << "Unsupported activation function: " << model_args.act_fn();
-    }
-  }
-
-  torch::Tensor forward(const torch::Tensor& hidden_states) {
-    torch::Tensor hidden = wi_->forward(hidden_states);
-    hidden = act_(hidden);
-    hidden = wo_->forward(hidden);
-    return hidden;
-  }
-
-  void load_state_dict(const StateDict& state_dict) {
-    // wi
-    wi_->load_state_dict(state_dict.get_dict_with_prefix("wi."));
-    // wo
-    wo_->load_state_dict(state_dict.get_dict_with_prefix("wo."));
-  }
-
-  void verify_loaded_weights(const std::string& prefix) const {
-    wi_->verify_loaded_weights(prefix + "wi.");
-    wo_->verify_loaded_weights(prefix + "wo.");
-  }
-
- private:
-  layer::AddMatmul wi_ = nullptr;
-  layer::AddMatmul wo_ = nullptr;
-  torch::nn::Functional act_ = nullptr;
-};
-
-class UMT5DenseGatedActDenseImpl : public UMT5DenseInterface {
- public:
-  explicit UMT5DenseGatedActDenseImpl(const ModelContext& context) {
-    auto model_args = context.get_model_args();
-    auto options = context.get_tensor_options();
-    wi_0_ = register_module(
-        "wi_0",
-        layer::AddMatmul(
-            model_args.d_model(), model_args.d_ff(), false, options));
-    wi_1_ = register_module(
-        "wi_1",
-        layer::AddMatmul(
-            model_args.d_model(), model_args.d_ff(), false, options));
-    wo_ = register_module(
-        "wo",
-        layer::AddMatmul(
-            model_args.d_ff(), model_args.d_model(), false, options));
-
-    if (model_args.act_fn() == "relu") {
-      act_ = register_module("act", torch::nn::Functional(torch::relu));
-    } else if (model_args.act_fn() == "gelu_new") {
-      act_ = register_module("act", torch::nn::Functional(umt5_gelu_new));
-    } else {
-      LOG(FATAL) << "Unsupported activation function: " << model_args.act_fn();
-    }
-  }
-
-  torch::Tensor forward(const torch::Tensor& hidden_states) {
-    torch::Tensor hidden_gelu = act_(wi_0_->forward(hidden_states));
-    torch::Tensor hidden_linear = wi_1_->forward(hidden_states);
-    torch::Tensor new_hidden_states = hidden_gelu * hidden_linear;
-    new_hidden_states = wo_->forward(new_hidden_states);
-    return new_hidden_states;
-  }
-
-  void load_state_dict(const StateDict& state_dict) {
-    // wi_0
-    wi_0_->load_state_dict(state_dict.get_dict_with_prefix("wi_0."));
-    // wi_1
-    wi_1_->load_state_dict(state_dict.get_dict_with_prefix("wi_1."));
-    // wo
-    wo_->load_state_dict(state_dict.get_dict_with_prefix("wo."));
-  }
-
-  void verify_loaded_weights(const std::string& prefix) const {
-    wi_0_->verify_loaded_weights(prefix + "wi_0.");
-    wi_1_->verify_loaded_weights(prefix + "wi_1.");
-    wo_->verify_loaded_weights(prefix + "wo.");
-  }
-
- private:
-  layer::AddMatmul wi_0_ = nullptr;
-  layer::AddMatmul wi_1_ = nullptr;
-  layer::AddMatmul wo_ = nullptr;
-  torch::nn::Functional act_ = nullptr;
-};
-
-class UMT5LayerFFNImpl : public torch::nn::Module {
+class UMT5LayerFFNImpl final : public torch::nn::Module {
  public:
   explicit UMT5LayerFFNImpl(const ModelContext& context) {
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
     layer_norm_ = register_module("layer_norm", UMT5LayerNorm(context));
     if (model_args.is_gated_act()) {
-      dense_relu_dense_ = register_module(
-          "DenseReluDense",
-          std::make_shared<UMT5DenseGatedActDenseImpl>(context));
+      dense_relu_dense_ =
+          register_module("DenseReluDense",
+                          std::make_shared<T5DenseGatedActDenseImpl>(context));
     } else {
       dense_relu_dense_ = register_module(
-          "DenseReluDense", std::make_shared<UMT5DenseActDenseImpl>(context));
+          "DenseReluDense", std::make_shared<T5DenseActDenseImpl>(context));
     }
   }
 
@@ -235,43 +88,14 @@ class UMT5LayerFFNImpl : public torch::nn::Module {
   }
 
  private:
-  std::shared_ptr<UMT5DenseInterface> dense_relu_dense_ = nullptr;
+  std::shared_ptr<T5DenseInterface> dense_relu_dense_ = nullptr;
   UMT5LayerNorm layer_norm_ = nullptr;
 };
 TORCH_MODULE(UMT5LayerFFN);
 
-class UMT5AttentionImpl : public torch::nn::Module {
+class UMT5AttentionImpl : public T5AttentionImpl {
  public:
-  UMT5AttentionImpl(const ModelContext& context,
-                    bool has_relative_attention_bias) {
-    auto model_args = context.get_model_args();
-    auto options = context.get_tensor_options();
-    has_relative_attention_bias_ = has_relative_attention_bias;
-    inner_dim_ = model_args.n_heads() * model_args.d_kv();
-
-    n_heads_ = model_args.n_heads();
-    key_value_proj_dim_ = model_args.d_kv();
-    d_model_ = model_args.d_model();
-    relative_attention_num_buckets_ =
-        model_args.relative_attention_num_buckets();
-    relative_attention_max_distance_ =
-        model_args.relative_attention_max_distance();
-
-    q_ = register_module(
-        "q", layer::AddMatmul(d_model_, inner_dim_, false, options));
-    k_ = register_module(
-        "k", layer::AddMatmul(d_model_, inner_dim_, false, options));
-    v_ = register_module(
-        "v", layer::AddMatmul(d_model_, inner_dim_, false, options));
-    o_ = register_module(
-        "o", layer::AddMatmul(inner_dim_, d_model_, false, options));
-
-    if (has_relative_attention_bias_) {
-      relative_attention_bias_ = register_module(
-          "relative_attention_bias",
-          torch::nn::Embedding(relative_attention_num_buckets_, n_heads_));
-    }
-  }
+  using T5AttentionImpl::T5AttentionImpl;
 
   std::vector<torch::Tensor> forward(
       const torch::Tensor& hidden_states,
@@ -285,7 +109,7 @@ class UMT5AttentionImpl : public torch::nn::Module {
     torch::Tensor query_states = q_->forward(hidden_states);
     query_states =
         query_states.view({batch_size, -1, n_heads_, key_value_proj_dim_})
-            .transpose(1, 2);  // (batch_size, n_heads, seq_len, head_dim)
+            .transpose(1, 2);
 
     torch::Tensor current_states =
         is_cross_attention ? key_value_states.value() : hidden_states;
@@ -293,13 +117,12 @@ class UMT5AttentionImpl : public torch::nn::Module {
     torch::Tensor value_states = v_->forward(current_states);
     key_states =
         key_states.view({batch_size, -1, n_heads_, key_value_proj_dim_})
-            .transpose(1, 2);  // (batch_size, n_heads, key_len, head_dim)
+            .transpose(1, 2);
     value_states =
         value_states.view({batch_size, -1, n_heads_, key_value_proj_dim_})
-            .transpose(1, 2);  // (batch_size, n_heads, key_len, head_dim)
-    torch::Tensor scores = torch::matmul(
-        query_states,
-        key_states.transpose(3, 2));  // (batch, n_heads, seq_len, key_len)
+            .transpose(1, 2);
+    torch::Tensor scores =
+        torch::matmul(query_states, key_states.transpose(3, 2));
     torch::Tensor curr_position_bias;
     if (position_bias.has_value() && position_bias.value().numel() > 0) {
       curr_position_bias = position_bias.value();
@@ -339,140 +162,25 @@ class UMT5AttentionImpl : public torch::nn::Module {
                                                      torch::indexing::Slice(),
                                                      torch::indexing::Slice()});
     }
-    // LOG(INFO) << "umt5 curr_position_bias; shape" <<
-    // curr_position_bias.sizes();
     scores += curr_position_bias;
     torch::Tensor attn_weights =
         torch::softmax(scores.to(torch::kFloat), -1).to(scores.dtype());
     if (layer_head_mask.has_value() && layer_head_mask.value().numel() > 0) {
       attn_weights = attn_weights * layer_head_mask.value();
     }
-    torch::Tensor attn_output = torch::matmul(
-        attn_weights, value_states);  // (batch, n_heads, seq_len, head_dim)
-    attn_output = attn_output.transpose(1, 2)
-                      .contiguous();  // (batch, seq_len, n_heads, head_dim)
+    torch::Tensor attn_output = torch::matmul(attn_weights, value_states);
+    attn_output = attn_output.transpose(1, 2).contiguous();
     attn_output = attn_output.view({batch_size, -1, inner_dim_});
     attn_output = o_->forward(attn_output);
-    std::vector<torch::Tensor> outputs = {attn_output, attn_weights};
-    return outputs;
-  }
-
-  void load_state_dict(const StateDict& state_dict) {
-    q_->load_state_dict(state_dict.get_dict_with_prefix("q."));
-    k_->load_state_dict(state_dict.get_dict_with_prefix("k."));
-    v_->load_state_dict(state_dict.get_dict_with_prefix("v."));
-    o_->load_state_dict(state_dict.get_dict_with_prefix("o."));
-    if (has_relative_attention_bias_) {
-      weight::load_weight(state_dict,
-                          "relative_attention_bias.weight",
-                          relative_attention_bias_->weight,
-                          is_relative_attention_bias_loaded_);
-    }
-  }
-
-  void verify_loaded_weights(const std::string& prefix) const {
-    q_->verify_loaded_weights(prefix + "q.");
-    k_->verify_loaded_weights(prefix + "k.");
-    v_->verify_loaded_weights(prefix + "v.");
-    o_->verify_loaded_weights(prefix + "o.");
-    if (has_relative_attention_bias_) {
-      CHECK(is_relative_attention_bias_loaded_)
-          << "weight is not loaded for "
-          << prefix + "relative_attention_bias.weight";
-    }
+    return {attn_output, attn_weights};
   }
 
  private:
-  torch::Tensor _relative_position_bucket(torch::Tensor& relative_position,
-                                          bool bidirectional = true,
-                                          int64_t num_buckets = 32,
-                                          int64_t max_distance = 128) const {
-    torch::Tensor relative_buckets =
-        torch::zeros_like(relative_position, torch::kLong);
-    if (bidirectional) {
-      num_buckets /= 2;
-      relative_buckets +=
-          (relative_position > 0).to(torch::kLong) * num_buckets;
-      auto abs_relative_position = torch::abs(relative_position);
-      relative_position = abs_relative_position;
-    } else {
-      relative_position =
-          -torch::min(relative_position, torch::zeros_like(relative_position));
-    }
-    int64_t max_exact = num_buckets / 2;
-    torch::Tensor is_small = relative_position < max_exact;
-    auto relative_position_float = relative_position.to(torch::kFloat);
-    auto max_exact_float = static_cast<float>(max_exact);
-    auto max_distance_float = static_cast<float>(max_distance);
-    torch::Tensor relative_position_if_large =
-        max_exact + (torch::log(relative_position_float / max_exact_float) /
-                     std::log(max_distance_float / max_exact_float) *
-                     (num_buckets - max_exact))
-                        .to(torch::kLong);
-    relative_position_if_large = torch::min(
-        relative_position_if_large,
-        torch::full_like(
-            relative_position_if_large, num_buckets - 1, torch::kLong));
-    relative_buckets +=
-        torch::where(is_small, relative_position, relative_position_if_large);
-    return relative_buckets;
-  }
-
-  torch::Tensor compute_bias(
-      int64_t query_length,
-      int64_t key_length,
-      std::optional<torch::Device> device = std::nullopt) const {
-    if (!has_relative_attention_bias_) {
-      return torch::zeros(
-          {1, n_heads_, query_length, key_length},
-          torch::dtype(torch::kFloat).device(device.value_or(torch::kCPU)));
-    }
-
-    torch::Device dev =
-        device.value_or(relative_attention_bias_->weight.device());
-
-    torch::Tensor context_position;
-    context_position =
-        torch::arange(query_length, torch::dtype(torch::kLong).device(dev))
-            .unsqueeze(1);
-
-    torch::Tensor memory_position =
-        torch::arange(key_length, torch::dtype(torch::kLong).device(dev))
-            .unsqueeze(0);
-    torch::Tensor relative_position = memory_position - context_position;
-    torch::Tensor relative_position_bucket =
-        _relative_position_bucket(relative_position,
-                                  true,
-                                  relative_attention_num_buckets_,
-                                  relative_attention_max_distance_);
-    torch::Tensor values =
-        const_cast<torch::nn::EmbeddingImpl*>(relative_attention_bias_.get())
-            ->forward(relative_position_bucket);
-    values = values.permute({2, 0, 1}).unsqueeze(0);
-
-    return values;
-  }
-
- private:
-  bool has_relative_attention_bias_;
-  int64_t relative_attention_num_buckets_;
-  int64_t relative_attention_max_distance_;
-  int64_t d_model_;
-  int64_t key_value_proj_dim_;
-  int64_t n_heads_;
-  int64_t inner_dim_;
-  std::optional<int64_t> layer_idx_;
-  layer::AddMatmul q_ = nullptr;
-  layer::AddMatmul k_ = nullptr;
-  layer::AddMatmul v_ = nullptr;
-  layer::AddMatmul o_ = nullptr;
-  torch::nn::Embedding relative_attention_bias_ = nullptr;
-  bool is_relative_attention_bias_loaded_ = false;
   std::unordered_set<int64_t> pruned_heads_;
 };
 TORCH_MODULE(UMT5Attention);
 
-class UMT5LayerSelfAttentionImpl : public torch::nn::Module {
+class UMT5LayerSelfAttentionImpl final : public torch::nn::Module {
  public:
   UMT5LayerSelfAttentionImpl(const ModelContext& context,
                              bool has_relative_attention_bias) {
@@ -498,7 +206,7 @@ class UMT5LayerSelfAttentionImpl : public torch::nn::Module {
     torch::Tensor updated_hidden_states = hidden_states + attention_output[0];
 
     std::vector<torch::Tensor> outputs = {updated_hidden_states};
-    outputs.push_back(attention_output[1]);
+    outputs.emplace_back(attention_output[1]);
     return outputs;
   }
 
@@ -520,7 +228,7 @@ class UMT5LayerSelfAttentionImpl : public torch::nn::Module {
 };
 TORCH_MODULE(UMT5LayerSelfAttention);
 
-class UMT5BlockImpl : public torch::nn::Module {
+class UMT5BlockImpl final : public torch::nn::Module {
  public:
   UMT5BlockImpl(const ModelContext& context, bool has_relative_attention_bias) {
     auto model_args = context.get_model_args();
@@ -534,14 +242,13 @@ class UMT5BlockImpl : public torch::nn::Module {
   std::vector<torch::Tensor> forward(
       const torch::Tensor& hidden_states,
       const std::optional<torch::Tensor>& attention_mask = std::nullopt,
-      // const std::optional<torch::Tensor>& position_bias = std::nullopt,
       const std::optional<torch::Tensor>& layer_head_mask = std::nullopt) {
     auto self_attention_outputs = self_attention_->forward(
         hidden_states, attention_mask, layer_head_mask);
     torch::Tensor curr_hidden_states = self_attention_outputs[0];
     std::vector<torch::Tensor> attention_outputs;
     for (size_t i = 1; i < self_attention_outputs.size(); ++i) {
-      attention_outputs.push_back(self_attention_outputs[i]);
+      attention_outputs.emplace_back(self_attention_outputs[i]);
     }
 
     if (curr_hidden_states.dtype() == torch::kFloat16) {
@@ -555,9 +262,6 @@ class UMT5BlockImpl : public torch::nn::Module {
     }
 
     std::vector<torch::Tensor> outputs = {curr_hidden_states};
-    // outputs.insert(
-    //     outputs.end(), attention_outputs.begin(), attention_outputs.end());
-
     return outputs;
   }
 
@@ -592,13 +296,12 @@ class UMT5BlockImpl : public torch::nn::Module {
     return torch::clamp(x, -clamp_value, clamp_value);
   }
 
- private:
   UMT5LayerSelfAttention self_attention_ = nullptr;
   UMT5LayerFFN ff_layer_ = nullptr;
 };
 TORCH_MODULE(UMT5Block);
 
-class UMT5EncoderModelImpl : public torch::nn::Module {
+class UMT5EncoderModelImpl final : public torch::nn::Module {
  public:
   explicit UMT5EncoderModelImpl(const ModelContext& context) {
     auto model_args = context.get_model_args();
@@ -613,32 +316,23 @@ class UMT5EncoderModelImpl : public torch::nn::Module {
       bool has_relative_bias = true;
       auto block = UMT5Block(context, has_relative_bias);
       blocks_->push_back(block);
-      layers_.push_back(block);
+      layers_.emplace_back(block);
     }
     final_layer_norm_ =
-        register_module("final_layer_norm", UMT5LayerNorm(context, true));
+        register_module("final_layer_norm", UMT5LayerNorm(context));
   }
 
   torch::Tensor forward(
       const torch::Tensor& input_ids,
       const std::optional<torch::Tensor>& attention_mask = std::nullopt) {
-    // Prepare input parameters
     auto options = torch::TensorOptions()
                        .dtype(torch::typeMetaToScalarType(input_ids.dtype()))
                        .device(input_ids.device());
 
     torch::Tensor hidden_states = embed_tokens_->forward(input_ids);
-    auto save_embed_tokens_ = hidden_states.to(torch::kCPU);
-    // torch::save(save_embed_tokens_,
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/embed_token_cpp.pt");
-    auto input_shape =
-        hidden_states.sizes();  // (batch_size, seq_length, d_model)
+    auto input_shape = hidden_states.sizes();
     int64_t batch_size = input_shape[0];
     int64_t seq_length = input_shape[1];
-    // torch::Tensor causal_mask = torch::Tensor();
-    // std::vector<torch::Tensor> all_hidden_states;
-    // std::vector<torch::Tensor> all_attentions;
-    // torch::Tensor position_bias = torch::Tensor();
     torch::Tensor causal_mask;
     if (attention_mask.has_value() && attention_mask.value().numel() > 0) {
       causal_mask = attention_mask.value();
@@ -649,33 +343,14 @@ class UMT5EncoderModelImpl : public torch::nn::Module {
           (-1e4);
     }
 
-    LOG(INFO) << "causal_mask shape" << causal_mask.sizes();
-    auto save_mask = causal_mask.to(torch::kCPU);
-    // torch::save(save_mask,
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/prompt_mask_cpp.pt");
-
-    // causal_mask = torch::Tensor();
     for (size_t i = 0; i < layers_.size(); ++i) {
       torch::Tensor layer_head_mask = torch::Tensor();
       auto layer_outputs =
           layers_[i]->forward(hidden_states, causal_mask, layer_head_mask);
       hidden_states = layer_outputs[0];
-      if (i == 0) {
-        auto save_layer0_hiddenstate = hidden_states.to(torch::kCPU);
-        // torch::save(save_layer0_hiddenstate,
-        // "/home/weinan5/zjs/tensors_save_dir/cpp/umt5_layer0_cpp.pt");
-      }
-      // position_bias = layer_outputs[1];
       layer_outputs.clear();
     }
-    auto save_before_norm = hidden_states.to(torch::kCPU);
-    // torch::save(save_before_norm,
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/umt5_beforenorm_cpp.pt");
     hidden_states = final_layer_norm_->forward(hidden_states);
-
-    auto save_after_norm = hidden_states.to(torch::kCPU);
-    // torch::save(save_after_norm,
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/umt5_result_cpp.pt");
 
     return hidden_states;
   }
@@ -696,7 +371,6 @@ class UMT5EncoderModelImpl : public torch::nn::Module {
     }
     verify_loaded_weights();
     LOG(INFO) << "UMT5EncoderModel loaded successfully.";
-    // this->to(torch::kFloat32);
   }
 
   void verify_loaded_weights() const {

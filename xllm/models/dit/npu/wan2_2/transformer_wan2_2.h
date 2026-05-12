@@ -93,15 +93,38 @@ class FP32LayerNormImpl : public torch::nn::Module {
     }
   }
 
-  // [BF16_NORM] Match Python autocast: layer_norm in input dtype (BF16),
-  // not FP32. FP32 produces more accurate but DIFFERENT results from Python.
+  // Match Python autocast: layer_norm is promoted to FP32 under autocast,
+  // then result is cast back to BF16.
   torch::Tensor forward(const torch::Tensor& x) {
+    auto origin_dtype = x.dtype();
+    auto x_fp32 = x.to(torch::kFloat32);
+    torch::Tensor result;
     if (elementwise_affine_) {
-      return torch::layer_norm(x, {normalized_shape_}, weight_, bias_, eps_);
+      result = torch::layer_norm(x_fp32,
+                                 {normalized_shape_},
+                                 weight_.to(torch::kFloat32),
+                                 bias_.to(torch::kFloat32),
+                                 eps_);
     } else {
-      return torch::layer_norm(
-          x, {normalized_shape_}, torch::nullopt, torch::nullopt, eps_);
+      result = torch::layer_norm(
+          x_fp32, {normalized_shape_}, torch::nullopt, torch::nullopt, eps_);
     }
+    return result.to(origin_dtype);
+  }
+
+  // Same as forward() but keeps result in FP32 — needed when subsequent
+  // ops (like modulation) should also run in FP32 to match Python autocast.
+  torch::Tensor forward_fp32(const torch::Tensor& x) {
+    auto x_fp32 = x.to(torch::kFloat32);
+    if (elementwise_affine_) {
+      return torch::layer_norm(x_fp32,
+                               {normalized_shape_},
+                               weight_.to(torch::kFloat32),
+                               bias_.to(torch::kFloat32),
+                               eps_);
+    }
+    return torch::layer_norm(
+        x_fp32, {normalized_shape_}, torch::nullopt, torch::nullopt, eps_);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -182,6 +205,12 @@ class WanTimestepEmbeddingImpl : public torch::nn::Module {
   layer::AddMatmul linear_2_{nullptr};
 };
 TORCH_MODULE(WanTimestepEmbedding);
+
+inline std::string idx_tag(int& idx) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%03d_", idx++);
+  return std::string(buf);
+}
 
 class WanTimestepsImpl : public torch::nn::Module {
  public:
@@ -293,16 +322,16 @@ class WanGELUImpl : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states_in,
-                        const std::string& save_prefix = "") {
+                        const std::string& save_prefix = "",
+                        int& save_idx = *new int(0)) {
     // [BF16_MATMUL] 恢复标准 BF16 matmul，匹配 Python 的 nn.Linear
     // FP32 matmul 虽然数学上更精确，但和 Python 的 BF16 结果不同，无法对齐
     torch::Tensor hidden_states = proj_->forward(hidden_states_in);
-    // [SAVE_REDUCE] 注释掉 ff_linear1/ff_gelu 的 save
     // if (!save_prefix.empty()) {
     //   if (parallel_args_.rank_ == 0) {
     //     torch::save(hidden_states.contiguous(),
-    //     "/home/weinan5/zjs/tensors_save_dir/cpp/ff_linear1" + save_prefix +
-    //     "_cpp.pt");
+    //     "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
+    //     "ff_linear1" + save_prefix + "_cpp.pt");
     //   }
     // }
     if (approximate_) {
@@ -310,12 +339,11 @@ class WanGELUImpl : public torch::nn::Module {
     } else {
       hidden_states = torch::gelu(hidden_states);
     }
-    // [SAVE_REDUCE] 注释掉 ff_gelu 的 save
     // if (!save_prefix.empty()) {
     //   if (parallel_args_.rank_ == 0) {
     //     torch::save(hidden_states.contiguous(),
-    //     "/home/weinan5/zjs/tensors_save_dir/cpp/ff_gelu" + save_prefix +
-    //     "_cpp.pt");
+    //     "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
+    //     "ff_gelu" + save_prefix + "_cpp.pt");
     //   }
     // }
     return hidden_states;
@@ -415,23 +443,16 @@ class WanFeedForwardImpl : public torch::nn::Module {
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states,
-                        const std::string& save_prefix = "") {
-    auto output = act_fn_->forward(hidden_states, save_prefix);
+                        const std::string& save_prefix = "",
+                        int& save_idx = *new int(0)) {
+    auto output = act_fn_->forward(hidden_states, save_prefix, save_idx);
     output = dropout_->forward(output);
     // [BF16_MATMUL] 恢复标准 BF16 matmul，匹配 Python 的 nn.Linear
     output = proj_out_->forward(output);
-    // [SAVE_REDUCE] 注释掉 ff_linear2 的 save 和 DIM4394 调试
     // if (!save_prefix.empty() && parallel_args_.rank_ == 0) {
     //   torch::save(output.contiguous(),
-    //   "/home/weinan5/zjs/tensors_save_dir/cpp/ff_linear2" + save_prefix +
-    //   "_cpp.pt"); int target_dim = 4394; if (output.size(-1) > target_dim) {
-    //     auto col = output.slice(-1, target_dim, target_dim +
-    //     1).to(torch::kFloat32); LOG(INFO) << "[DIM4394] ff_linear2" <<
-    //     save_prefix
-    //               << " dim=4394 mean=" << col.mean().item<float>()
-    //               << " absmax=" << col.abs().max().item<float>()
-    //               << " std=" << col.std().item<float>();
-    //   }
+    //   "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
+    //   "ff_linear2" + save_prefix + "_cpp.pt");
     // }
     if (final_dropout_) {
       output = final_dropout_->forward(output);
@@ -720,7 +741,8 @@ class WanAttentionImpl : public torch::nn::Module {
       const torch::Tensor& encoder_hidden_states = torch::Tensor(),
       std::optional<std::pair<torch::Tensor, torch::Tensor>> rotary_emb =
           std::nullopt,
-      const std::string& save_prefix = "") {
+      const std::string& save_prefix = "",
+      int& save_idx = *new int(0)) {
     torch::Tensor hidden_states = hidden_states_in;
     bool is_self_attention =
         !encoder_hidden_states.defined() ||
@@ -744,31 +766,49 @@ class WanAttentionImpl : public torch::nn::Module {
     torch::Tensor key = to_k_->forward(encoder_hidden_states_text);
     torch::Tensor value = to_v_->forward(encoder_hidden_states_text);
 
-    if (!save_prefix.empty()) {
-      // [SAVE_REDUCE] 只保留关键 tensor 的 save，加速比对
-      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
-      std::string layer_tag = "_layer_" + save_prefix;
-      if (parallel_args_.rank_ == 0) {
-        // torch::save(query.contiguous(), cpp_save_dir + "/to_q_linear_out" +
-        // layer_tag + "_cpp.pt"); torch::save(key.contiguous(), cpp_save_dir +
-        // "/to_k_linear_out" + layer_tag + "_cpp.pt");
-        // torch::save(value.contiguous(), cpp_save_dir + "/to_v_linear_out" +
-        // layer_tag + "_cpp.pt");
-      }
-    }
+    // if (!save_prefix.empty()) {
+    //   std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+    //   std::string layer_tag = "_layer_" + save_prefix;
+    //   if (is_self_attention) {
+    //     if (parallel_args_.rank_ == 0) {
+    //       torch::save(query.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "to_q_linear_out" + layer_tag + "_cpp.pt");
+    //       torch::save(key.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "to_k_linear_out" + layer_tag + "_cpp.pt");
+    //       torch::save(value.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "to_v_linear_out" + layer_tag + "_cpp.pt");
+    //     }
+    //   } else {
+    //     if (parallel_args_.rank_ == 0) {
+    //       torch::save(query.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "cross_to_q_linear_out" + layer_tag +
+    //       "_cpp.pt"); torch::save(key.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "cross_to_k_linear_out" + layer_tag +
+    //       "_cpp.pt"); torch::save(value.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "cross_to_v_linear_out" + layer_tag +
+    //       "_cpp.pt");
+    //     }
+    //   }
+    // }
 
     query = std::get<0>(norm_q_->forward(query));
     key = std::get<0>(norm_k_->forward(key));
 
-    if (!save_prefix.empty()) {
-      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
-      std::string layer_tag = "_layer_" + save_prefix;
-      if (parallel_args_.rank_ == 0) {
-        // torch::save(query.contiguous(), cpp_save_dir + "/q_after_normq" +
-        // layer_tag + "_cpp.pt"); torch::save(key.contiguous(), cpp_save_dir +
-        // "/k_after_normk" + layer_tag + "_cpp.pt");
-      }
-    }
+    // if (!save_prefix.empty()) {
+    //   std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+    //   std::string layer_tag = "_layer_" + save_prefix;
+    //   if (is_self_attention) {
+    //     if (parallel_args_.rank_ == 0) {
+    //       torch::save(query.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "q_after_normq" + layer_tag + "_cpp.pt");
+    //       torch::save(key.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "k_after_normk" + layer_tag + "_cpp.pt");
+    //     }
+    //   } else {
+    //     // Cross-attention q/k saves are done below (after reshape) together
+    //     with v
+    //   }
+    // }
 
     if (FLAGS_tp_size > 1) {
       query = parallel_state::scatter(
@@ -793,37 +833,49 @@ class WanAttentionImpl : public torch::nn::Module {
       key = wan_apply_rotary_emb(key, freqs_cos, freqs_sin);
     }
 
-    if (!save_prefix.empty()) {
-      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
-      std::string layer_tag = "_layer_" + save_prefix;
-
-      // [TP_DISABLED] 不需要 gather，张量已经是完整的
-      // 旧代码：
-      // torch::Tensor q_save = query;
-      // torch::Tensor k_save = key;
-      // torch::Tensor v_save = value;
-      // if (FLAGS_tp_size > 1) {
-      //   q_save = query.flatten(2, 3);
-      //   k_save = key.flatten(2, 3);
-      //   v_save = value.flatten(2, 3);
-      //   q_save = parallel_state::gather(q_save, parallel_args_.dit_tp_group_,
-      //   -1); k_save = parallel_state::gather(k_save,
-      //   parallel_args_.dit_tp_group_, -1); v_save =
-      //   parallel_state::gather(v_save, parallel_args_.dit_tp_group_, -1);
-      //   q_save = q_save.view({batch_size, -1, heads_, dim_head_});
-      //   k_save = k_save.view({batch_size, -1, heads_, dim_head_});
-      //   v_save = v_save.view({batch_size, -1, heads_, dim_head_});
-      // }
-
-      if (parallel_args_.rank_ == 0) {
-        // torch::save(query.contiguous(), cpp_save_dir +
-        // "/self_attn_q_after_rope" + layer_tag + "_cpp.pt");
-        // torch::save(key.contiguous(), cpp_save_dir +
-        // "/self_attn_k_after_rope" + layer_tag + "_cpp.pt");
-        // torch::save(value.contiguous(), cpp_save_dir +
-        // "/self_attn_v_before_attn" + layer_tag + "_cpp.pt");
-      }
-    }
+    // if (!save_prefix.empty()) {
+    //   std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+    //   std::string layer_tag = "_layer_" + save_prefix;
+    //
+    //   // [TP_DISABLED] 不需要 gather，张量已经是完整的
+    //   // 旧代码：
+    //   // torch::Tensor q_save = query;
+    //   // torch::Tensor k_save = key;
+    //   // torch::Tensor v_save = value;
+    //   // if (FLAGS_tp_size > 1) {
+    //   //   q_save = query.flatten(2, 3);
+    //   //   k_save = key.flatten(2, 3);
+    //   //   v_save = value.flatten(2, 3);
+    //   //   q_save = parallel_state::gather(q_save,
+    //   parallel_args_.dit_tp_group_, -1);
+    //   //   k_save = parallel_state::gather(k_save,
+    //   parallel_args_.dit_tp_group_, -1);
+    //   //   v_save = parallel_state::gather(v_save,
+    //   parallel_args_.dit_tp_group_, -1);
+    //   //   q_save = q_save.view({batch_size, -1, heads_, dim_head_});
+    //   //   k_save = k_save.view({batch_size, -1, heads_, dim_head_});
+    //   //   v_save = v_save.view({batch_size, -1, heads_, dim_head_});
+    //   // }
+    //
+    //   if (parallel_args_.rank_ == 0) {
+    //     if (is_self_attention) {
+    //       torch::save(query.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "self_attn_q_after_rope" + layer_tag +
+    //       "_cpp.pt"); torch::save(key.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "self_attn_k_after_rope" + layer_tag +
+    //       "_cpp.pt"); torch::save(value.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "self_attn_v_before_attn" + layer_tag +
+    //       "_cpp.pt");
+    //     } else {
+    //       torch::save(query.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "cross_q_after_normq" + layer_tag + "_cpp.pt");
+    //       torch::save(key.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "cross_k_after_normk" + layer_tag + "_cpp.pt");
+    //       torch::save(value.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "cross_v_before_attn" + layer_tag + "_cpp.pt");
+    //     }
+    //   }
+    // }
 
     torch::Tensor hidden_states_img;
     if (encoder_hidden_states_img.defined()) {
@@ -885,6 +937,7 @@ class WanAttentionImpl : public torch::nn::Module {
       auto q_t = query.transpose(1, 2);  // [B,S,N,D] -> [B,N,S,D]
       auto k_t = key.transpose(1, 2);
       auto v_t = value.transpose(1, 2);
+      // [DIAG] Q/K/V saves removed
       int64_t head_num = q_t.size(1);
       int64_t head_dim = q_t.size(-1);
       auto results = at_npu::native::custom_ops::npu_fusion_attention(
@@ -919,32 +972,44 @@ class WanAttentionImpl : public torch::nn::Module {
       hidden_states = hidden_states + hidden_states_img;
     }
 
-    if (!save_prefix.empty()) {
-      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
-      std::string layer_tag = "_layer_" + save_prefix;
-      // [TP_DISABLED] 不需要 gather，张量已经是完整的
-      // 旧代码：
-      // torch::Tensor attn_before_save = hidden_states;
-      // if (FLAGS_tp_size > 1) {
-      //   attn_before_save = parallel_state::gather(hidden_states,
-      //   parallel_args_.dit_tp_group_, -1);
-      // }
-      if (parallel_args_.rank_ == 0) {
-        // torch::save(hidden_states.contiguous(), cpp_save_dir +
-        // "/attn_before_o_proj" + layer_tag + "_cpp.pt");
-      }
-    }
+    // if (!save_prefix.empty()) {
+    //   std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+    //   std::string layer_tag = "_layer_" + save_prefix;
+    //   // [TP_DISABLED] 不需要 gather，张量已经是完整的
+    //   // 旧代码：
+    //   // torch::Tensor attn_before_save = hidden_states;
+    //   // if (FLAGS_tp_size > 1) {
+    //   //   attn_before_save = parallel_state::gather(hidden_states,
+    //   parallel_args_.dit_tp_group_, -1);
+    //   // }
+    //   if (parallel_args_.rank_ == 0) {
+    //     if (is_self_attention) {
+    //       torch::save(hidden_states.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "attn_before_o_proj" + layer_tag + "_cpp.pt");
+    //     } else {
+    //       torch::save(hidden_states.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "cross_attn_before_o_proj" + layer_tag +
+    //       "_cpp.pt");
+    //     }
+    //   }
+    // }
 
     hidden_states = to_out_->forward(hidden_states);
 
-    if (!save_prefix.empty()) {
-      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
-      std::string layer_tag = "_layer_" + save_prefix;
-      if (parallel_args_.rank_ == 0) {
-        // torch::save(hidden_states.contiguous(), cpp_save_dir +
-        // "/attn_after_o_proj" + layer_tag + "_cpp.pt");
-      }
-    }
+    // if (!save_prefix.empty()) {
+    //   std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+    //   std::string layer_tag = "_layer_" + save_prefix;
+    //   if (parallel_args_.rank_ == 0) {
+    //     if (is_self_attention) {
+    //       torch::save(hidden_states.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "attn_after_o_proj" + layer_tag + "_cpp.pt");
+    //     } else {
+    //       torch::save(hidden_states.contiguous(), cpp_save_dir + "/" +
+    //       idx_tag(save_idx) + "cross_attn_after_o_proj" + layer_tag +
+    //       "_cpp.pt");
+    //     }
+    //   }
+    // }
 
     return hidden_states;
   }
@@ -1126,19 +1191,30 @@ class WanTimeTextImageEmbeddingImpl : public torch::nn::Module {
           const torch::Tensor& encoder_hidden_states_image = torch::Tensor(),
           std::optional<int64_t> timestep_seq_len = std::nullopt) {
     torch::Tensor timestep_proj = timesteps_proj_->forward(timestep);
-    if (timestep_seq_len.has_value()) {
+    int64_t seq_len = timestep_seq_len.value_or(1);
+    if (seq_len > 1) {
+      // Match Python: expand timestep to seq_len before embeddings
+      auto ts = timestep.expand({1, seq_len}).flatten();
       timestep_proj =
-          timestep_proj.view({-1, timestep_seq_len.value(), time_freq_dim_});
+          timesteps_proj_->forward(ts).view({-1, seq_len, time_freq_dim_});
     }
-    LOG(INFO) << "[DIAG_EMBED] timestep_proj dtype=" << timestep_proj.dtype()
-              << " encoder_hs dtype=" << encoder_hidden_states.dtype();
-    torch::Tensor temb = time_embedder_->forward(timestep_proj)
-                             .to(encoder_hidden_states.dtype());
+    timestep_proj = timestep_proj.to(torch::kFloat32);
+    // Match Python autocast: sinusoidal is FP32, but autocast converts to BF16
+    // before the linear layers. C++ must do the same cast BEFORE the linear,
+    // not after, to get the same BF16 intermediate rounding.
+    auto embed_dtype = encoder_hidden_states.dtype();
+    torch::Tensor temb = time_embedder_->forward(timestep_proj.to(embed_dtype));
     LOG(INFO) << "[DIAG_EMBED] temb dtype=" << temb.dtype();
     torch::Tensor timestep_proj_out =
         time_proj_->forward(act_fn_->forward(temb));
+    if (seq_len > 1) {
+      timestep_proj_out = timestep_proj_out.view({-1, seq_len, 6, dim_});
+    } else {
+      timestep_proj_out = timestep_proj_out.view({-1, 6, dim_});
+    }
     LOG(INFO) << "[DIAG_EMBED] timestep_proj_out dtype="
-              << timestep_proj_out.dtype();
+              << timestep_proj_out.dtype()
+              << " shape=" << timestep_proj_out.sizes();
 
     torch::Tensor text_emb = text_embedder_->forward(encoder_hidden_states);
     LOG(INFO) << "[DIAG_EMBED] text_emb dtype=" << text_emb.dtype();
@@ -1362,7 +1438,8 @@ class WanTransformerBlockImpl : public torch::nn::Module {
                         const torch::Tensor& encoder_hidden_states,
                         const torch::Tensor& timestep_proj,
                         std::optional<std::pair<torch::Tensor, torch::Tensor>>
-                            rotary_emb = std::nullopt) {
+                            rotary_emb = std::nullopt,
+                        int& save_idx = *new int(0)) {
     torch::Tensor hidden_states = hidden_states_in;
     torch::Tensor shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa,
         c_gate_msa;
@@ -1414,88 +1491,20 @@ class WanTransformerBlockImpl : public torch::nn::Module {
     // }
 
     std::string save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
-    std::string layer_suffix =
-        "_layer_" + std::to_string(block_idx_) + "_cpp.pt";
-
-    // [DISABLED] modulation params already verified OK
-    // if (parallel_args_.rank_ == 0) {
-    //   torch::save(scale_shift_table_.contiguous(), save_dir +
-    //   "/scale_shift_table" + layer_suffix);
-    //   torch::save(timestep_proj.contiguous(), save_dir +
-    //   "/timestep_proj_block" + layer_suffix);
-    //   torch::save(shift_msa.contiguous(), save_dir + "/shift_msa" +
-    //   layer_suffix); torch::save(scale_msa.contiguous(), save_dir +
-    //   "/scale_msa" + layer_suffix); torch::save(gate_msa.contiguous(),
-    //   save_dir + "/gate_msa" + layer_suffix);
-    //   torch::save(c_shift_msa.contiguous(), save_dir + "/c_shift_msa" +
-    //   layer_suffix); torch::save(c_scale_msa.contiguous(), save_dir +
-    //   "/c_scale_msa" + layer_suffix); torch::save(c_gate_msa.contiguous(),
-    //   save_dir + "/c_gate_msa" + layer_suffix);
-    // }
 
     torch::Tensor norm1_result = norm1_->forward(hidden_states);
-    // [DISABLED] norm1 already verified OK
-    // if (parallel_args_.rank_ == 0) {
-    //   torch::save(norm1_result.contiguous(), save_dir + "/norm1_output" +
-    //   layer_suffix);
-    // }
 
     torch::Tensor norm_hidden_states =
         (norm1_result.to(hidden_states.dtype()) * (1 + scale_msa) + shift_msa);
 
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // before_self_attn"; [DISABLED] before_self_attn already verified OK if
-    // (parallel_args_.rank_ == 0) {
-    //   torch::save(norm_hidden_states.contiguous(), save_dir +
-    //   "/before_self_attn" + layer_suffix);
-    // }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after save
-    // before_self_attn";
-
-    // [SAVE_ALL] 所有层都保存 self-attention 内部 tensor
     std::string attn1_save_prefix = std::to_string(block_idx_);
-    torch::Tensor attn_output = attn1_->forward(
-        norm_hidden_states, norm_hidden_states, rotary_emb, attn1_save_prefix);
-
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // self_attn_output"; [SAVE_ALL] 所有层都保存
-    if (parallel_args_.rank_ == 0) {
-      // [SAVE_REDUCE] torch::save(attn_output.contiguous(), save_dir +
-      // "/self_attn_output" + layer_suffix);
-    }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after save
-    // self_attn_output";
-
-    // if (block_idx_ >= 6 && block_idx_ <= 9) {
-    // auto abs_attn = attn_output.to(torch::kFloat32).abs();
-    // LOG(INFO) << "[DIAG] block_" << block_idx_ << " attn_output absmax=" <<
-    // abs_attn.max().item<float>()
-    // << " absmean=" << abs_attn.mean().item<float>();
-    // }
-
-    // [SAVE_ALL] 所有层都保存
-    if (parallel_args_.rank_ == 0) {
-      // [SAVE_REDUCE] torch::save((attn_output * gate_msa).contiguous(),
-      // save_dir + "/attn_output_mul_gate" + layer_suffix);
-    }
+    torch::Tensor attn_output = attn1_->forward(norm_hidden_states,
+                                                norm_hidden_states,
+                                                rotary_emb,
+                                                attn1_save_prefix,
+                                                save_idx);
 
     hidden_states = hidden_states + attn_output * gate_msa;
-
-    // if (block_idx_ >= 6 && block_idx_ <= 9) {
-    // auto abs_res = hidden_states.to(torch::kFloat32).abs();
-    // LOG(INFO) << "[DIAG] block_" << block_idx_ << " after_self_attn_residual
-    // absmax=" << abs_res.max().item<float>()
-    // << " absmean=" << abs_res.mean().item<float>();
-    // }
-
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // after_self_attn_residual"; [SAVE_ALL] 所有层都保存
-    if (parallel_args_.rank_ == 0) {
-      // [SAVE_REDUCE] torch::save(hidden_states.contiguous(), save_dir +
-      // "/after_self_attn_residual" + layer_suffix);
-    }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after save
-    // after_self_attn_residual";
 
     if (cross_attn_norm_) {
       norm_hidden_states = norm2_->forward(hidden_states);
@@ -1503,102 +1512,23 @@ class WanTransformerBlockImpl : public torch::nn::Module {
       norm_hidden_states = hidden_states;
     }
 
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // before_cross_attn"; [DISABLED] before_cross_attn already verified OK if
-    // (parallel_args_.rank_ == 0) {
-    //   torch::save(norm_hidden_states.contiguous(), save_dir +
-    //   "/before_cross_attn" + layer_suffix);
-    // }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after save
-    // before_cross_attn";
-
-    attn_output = attn2_->forward(
-        norm_hidden_states, encoder_hidden_states, std::nullopt);
-
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // cross_attn_output"; [DISABLED] cross_attn_output already verified OK if
-    // (parallel_args_.rank_ == 0) {
-    //   torch::save(attn_output.contiguous(), save_dir + "/cross_attn_output" +
-    //   layer_suffix);
-    // }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after save
-    // cross_attn_output";
-
-    // if (block_idx_ >= 6 && block_idx_ <= 9) {
-    // auto abs_cross = attn_output.to(torch::kFloat32).abs();
-    // LOG(INFO) << "[DIAG] block_" << block_idx_ << " cross_attn_output
-    // absmax=" << abs_cross.max().item<float>()
-    // << " absmean=" << abs_cross.mean().item<float>();
-    // }
+    attn_output = attn2_->forward(norm_hidden_states,
+                                  encoder_hidden_states,
+                                  std::nullopt,
+                                  std::to_string(block_idx_),
+                                  save_idx);
 
     hidden_states = hidden_states + attn_output;
 
-    // if (block_idx_ >= 6 && block_idx_ <= 9) {
-    // auto abs_res = hidden_states.to(torch::kFloat32).abs();
-    // LOG(INFO) << "[DIAG] block_" << block_idx_ << " after_cross_attn_residual
-    // absmax=" << abs_res.max().item<float>()
-    // << " absmean=" << abs_res.mean().item<float>();
-    // }
+    torch::Tensor norm2_result = norm3_->forward(hidden_states);
 
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // after_cross_attn_residual"; [SAVE_ALL] 所有层都保存
-    if (parallel_args_.rank_ == 0) {
-      // [SAVE_REDUCE] torch::save(hidden_states.contiguous(), save_dir +
-      // "/after_cross_attn_residual" + layer_suffix);
-    }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after save
-    // after_cross_attn_residual";
+    norm_hidden_states = (norm2_result * (1 + c_scale_msa) + c_shift_msa);
 
-    norm_hidden_states =
-        (norm3_->forward(hidden_states) * (1 + c_scale_msa) + c_shift_msa);
-
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // before_ffn"; [SAVE_ALL] 所有层都保存
-    if (parallel_args_.rank_ == 0) {
-      // [SAVE_REDUCE] torch::save(norm_hidden_states.contiguous(), save_dir +
-      // "/before_ffn" + layer_suffix);
-    }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after save
-    // before_ffn";
-
-    // [SAVE_ALL] 所有层都保存 FFN 内部 tensor (ff_linear1, ff_gelu, ff_linear2)
     std::string ff_save_prefix = "_layer_" + std::to_string(block_idx_);
-    torch::Tensor ff_output = ff_->forward(norm_hidden_states, ff_save_prefix);
-
-    if (parallel_args_.rank_ == 0) {
-      auto abs_ff = ff_output.to(torch::kFloat32).abs();
-      LOG(INFO) << "[DIAG] block_" << block_idx_
-                << " ffn_output absmax=" << abs_ff.max().item<float>()
-                << " absmean=" << abs_ff.mean().item<float>();
-    }
-
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // ffn_output"; [SAVE_ALL] 所有层都保存
-    if (parallel_args_.rank_ == 0) {
-      // [SAVE_REDUCE] torch::save(ff_output.contiguous(), save_dir +
-      // "/ffn_output" + layer_suffix); [SAVE_REDUCE] torch::save((ff_output *
-      // c_gate_msa).contiguous(), save_dir + "/ffn_output_mul_gate" +
-      // layer_suffix);
-    }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after save
-    // ffn_output";
+    torch::Tensor ff_output =
+        ff_->forward(norm_hidden_states, ff_save_prefix, save_idx);
 
     hidden_states = hidden_states + ff_output * c_gate_msa;
-
-    if (parallel_args_.rank_ == 0) {
-      auto abs_block = hidden_states.to(torch::kFloat32).abs();
-      LOG(INFO) << "[DIAG] block_" << block_idx_
-                << " block_output absmax=" << abs_block.max().item<float>()
-                << " absmean=" << abs_block.mean().item<float>();
-    }
-
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
-    // block_output"; [SAVE_ALL] 所有层都保存
-    if (parallel_args_.rank_ == 0) {
-      torch::save(hidden_states.contiguous(),
-                  save_dir + "/block_output" + layer_suffix);
-    }
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " done";
 
     return hidden_states;
   }
@@ -1680,13 +1610,6 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     freq_dim_ = model_args.time_freq_dim();
     ffn_dim_ = model_args.ffn_dim();
     num_layers_ = model_args.num_layers();
-    // [RESTORED] 已恢复完整层数，不再限制
-    // const int64_t LIMIT_LAYERS = 10;
-    // if (num_layers_ > LIMIT_LAYERS) {
-    //   LOG(INFO) << "[DEBUG_LIMIT_LAYERS] Limiting transformer from "
-    //             << num_layers_ << " to " << LIMIT_LAYERS << " layers";
-    //   num_layers_ = LIMIT_LAYERS;
-    // }
     image_dim_ = model_args.image_embed_dim();
     added_kv_proj_dim_ = model_args.added_kv_proj_dim();
     rope_max_seq_len_ = model_args.rope_max_seq_len();
@@ -1746,6 +1669,7 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
               << is_cfg << " hidden_states dtype=" << hidden_states_in.dtype()
               << " encoder_hs dtype=" << encoder_hidden_states.dtype()
               << " timestep dtype=" << timestep.dtype();
+    int save_idx = 0;
     int64_t batch_size = hidden_states_in.size(0);
     int64_t num_frames = hidden_states_in.size(2);
     int64_t height = hidden_states_in.size(3);
@@ -1761,6 +1685,38 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     torch::Tensor hidden_states = hidden_states_in;
 
     auto [freqs_cos, freqs_sin] = rope_->forward(hidden_states);
+
+    // ========== EXPERIMENT: Python input replacements ==========
+    // Each block can be independently enabled/disabled.
+    // Python tensors have seq_len=32132 (SP=4 padding), C++ needs 32130.
+    // We truncate .slice(1, 0, 32130) to remove the 2 padding tokens.
+
+    // --- [EXP 1] freqs (RoPE cos/sin) from Python --- DISABLED: inputs don't
+    // impact TP compounding test
+    // {
+    //   auto sd_freqs = StateDictFromSafeTensor::load(
+    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/freqs_0.safetensors");
+    //   int64_t target_seq = post_patch_num_frames * post_patch_height *
+    //   post_patch_width; auto py_freqs_cos =
+    //   sd_freqs->get_tensor("freqs_cos_0"); auto py_freqs_sin =
+    //   sd_freqs->get_tensor("freqs_sin_0"); if (py_freqs_cos.defined() &&
+    //   py_freqs_sin.defined()) {
+    //     // Python may have more tokens due to SP padding — truncate to match
+    //     C++ seq_len if (py_freqs_cos.size(1) > target_seq) {
+    //       py_freqs_cos = py_freqs_cos.slice(1, 0, target_seq);
+    //       py_freqs_sin = py_freqs_sin.slice(1, 0, target_seq);
+    //     }
+    //     freqs_cos =
+    //     py_freqs_cos.to(hidden_states.device()).to(torch::kFloat32);
+    //     freqs_sin =
+    //     py_freqs_sin.to(hidden_states.device()).to(torch::kFloat32);
+    //     LOG(INFO) << "[EXP1] Loaded RoPE freqs from Python, shape=" <<
+    //     freqs_cos.sizes();
+    //   } else {
+    //     LOG(WARNING) << "[EXP1] Failed to load Python RoPE freqs, using C++
+    //     computed freqs";
+    //   }
+    // }
     auto rotary_emb = std::make_pair(freqs_cos, freqs_sin);
 
     LOG(INFO) << "[DIAG_FWD] before patch_embedding, hidden dtype="
@@ -1771,25 +1727,42 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     hidden_states = hidden_states.flatten(2).transpose(1, 2);
     LOG(INFO) << "[DIAG_FWD] after patch_embedding OK";
 
-    // [PYTHON_INPUT] DISABLED: Python patch_embedding 有 seq_len padding，C++
-    // 没有 替换后精度反而恶化（cos 从 0.999990 降到 0.864）
+    // --- [EXP 2] patch_embedding (hidden_states after patch_embed + flatten)
+    // ---
     // {
     //   auto sd = StateDictFromSafeTensor::load(
-    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/dit_inputs.safetensors");
+    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/patch_embedding.safetensors");
     //   auto py_patch = sd->get_tensor("patch_embedding");
     //   if (py_patch.defined()) {
+    //     int64_t target_seq = hidden_states.size(1);  // 32130
+    //     if (py_patch.size(1) > target_seq) {
+    //       py_patch = py_patch.slice(1, 0, target_seq);
+    //     }
     //     hidden_states =
     //     py_patch.to(hidden_states.device()).to(hidden_states.dtype());
+    //     LOG(INFO) << "[EXP2] Replaced patch_embedding with Python tensor,
+    //     shape="
+    //               << hidden_states.sizes();
     //   }
     // }
 
+    // torch::save(hidden_states.contiguous(),
+    // "/home/weinan5/zjs/tensors_save_dir/cpp/patch_embedding_cpp.pt");
+    // torch::save(hidden_states.contiguous(),
+    // "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
+    // "patch_embedding_cpp.pt");
     torch::save(
-        hidden_states.contiguous(),
+        hidden_states.contiguous().to(torch::kFloat32).cpu(),
         "/home/weinan5/zjs/tensors_save_dir/cpp/patch_embedding_cpp.pt");
+    torch::save(freqs_cos.contiguous().to(torch::kFloat32).cpu(),
+                "/home/weinan5/zjs/tensors_save_dir/cpp/freqs_cos_cpp.pt");
+    torch::save(freqs_sin.contiguous().to(torch::kFloat32).cpu(),
+                "/home/weinan5/zjs/tensors_save_dir/cpp/freqs_sin_cpp.pt");
     torch::Tensor timestep_input = timestep;
-    std::optional<int64_t> ts_seq_len = std::nullopt;
+    // Match Python: expand timestep to seq_len for embedding computation
+    int64_t ts_seq_len_val = hidden_states.size(1);
+    std::optional<int64_t> ts_seq_len = ts_seq_len_val;
     if (timestep.dim() == 2) {
-      ts_seq_len = timestep.size(1);
       timestep_input = timestep.flatten();
     }
 
@@ -1808,21 +1781,92 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                                      ts_seq_len);
     LOG(INFO) << "[DIAG_FWD] after condition_embedder OK";
 
-    torch::save(temb.contiguous(),
-                "/home/weinan5/zjs/tensors_save_dir/cpp/temb_cpp.pt");
-    torch::save(
-        encoder_hidden_states_embedded.contiguous(),
-        "/home/weinan5/zjs/tensors_save_dir/cpp/prompt_embeds_tensor_cpp.pt");
+    // --- [EXP 3] temb (time embedding) ---
+    // {
+    //   auto sd_temb = StateDictFromSafeTensor::load(
+    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/temb.safetensors");
+    //   auto py_temb = sd_temb->get_tensor("temb");
+    //   if (py_temb.defined()) {
+    //     int64_t target_seq = hidden_states.size(1);  // 32130
+    //     if (py_temb.dim() >= 2 && py_temb.size(1) > target_seq) {
+    //       py_temb = py_temb.slice(1, 0, target_seq);
+    //     }
+    //     temb =
+    //     py_temb.to(hidden_states.device()).to(encoder_hidden_states_embedded.dtype());
+    //     LOG(INFO) << "[EXP3] Replaced temb with Python tensor, shape=" <<
+    //     temb.sizes();
+    //   }
+    // }
+    // --- [EXP 4] timestep_proj (time projection, shape [B, seq_len, 6, dim])
+    // ---
+    // {
+    //   auto sd_ts = StateDictFromSafeTensor::load(
+    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/timestep_proj.safetensors");
+    //   auto py_ts = sd_ts->get_tensor("timestep_proj");
+    //   if (py_ts.defined()) {
+    //     int64_t target_seq = hidden_states.size(1);  // 32130
+    //     if (py_ts.dim() == 4 && py_ts.size(1) > target_seq) {
+    //       py_ts = py_ts.slice(1, 0, target_seq);
+    //     } else if (py_ts.dim() == 3 && py_ts.size(1) == 6 &&
+    //                ts_seq_len.has_value() && ts_seq_len.value() > 1) {
+    //       py_ts = py_ts.unsqueeze(1).expand(
+    //           {batch_size, ts_seq_len.value(), 6, -1});
+    //     }
+    //     timestep_proj = py_ts.to(hidden_states.device()).to(torch::kFloat32);
+    //     LOG(INFO) << "[EXP4] Replaced timestep_proj with Python tensor,
+    //     shape=" << timestep_proj.sizes();
+    //   }
+    // }
+    // --- [EXP 5] context (text embedding) ---
+    // CFG: is_cfg=false → cond (load context.safetensors), is_cfg=true → uncond
+    // (load context_null.safetensors)
+    // {
+    //   std::string ctx_path = is_cfg
+    //       ?
+    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/context_null.safetensors"
+    //       :
+    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/context.safetensors";
+    //   auto sd_ctx = StateDictFromSafeTensor::load(ctx_path);
+    //   auto py_ctx = sd_ctx->get_tensor("context");
+    //   if (py_ctx.defined()) {
+    //     encoder_hidden_states_embedded =
+    //     py_ctx.to(hidden_states.device()).to(encoder_hidden_states_embedded.dtype());
+    //     LOG(INFO) << "[EXP5] Replaced context (" << (is_cfg ? "uncond" :
+    //     "cond")
+    //               << ") with Python tensor, shape=" <<
+    //               encoder_hidden_states_embedded.sizes();
+    //   }
+    // }
+    // ========== END EXPERIMENT BLOCKS ==========
 
-    if (ts_seq_len.has_value()) {
+    // torch::save(temb.contiguous(),
+    // "/home/weinan5/zjs/tensors_save_dir/cpp/temb_cpp.pt");
+    // torch::save(temb.contiguous(), "/home/weinan5/zjs/tensors_save_dir/cpp/"
+    // + idx_tag(save_idx) + "temb_cpp.pt");
+    // torch::save(encoder_hidden_states_embedded.contiguous(),
+    // "/home/weinan5/zjs/tensors_save_dir/cpp/prompt_embeds_tensor_cpp.pt");
+    // Save C++ computed inputs for comparison with Python
+    torch::save(temb.contiguous().to(torch::kFloat32).cpu(),
+                "/home/weinan5/zjs/tensors_save_dir/cpp/temb_cpp.pt");
+    torch::save(timestep_proj.contiguous().to(torch::kFloat32).cpu(),
+                "/home/weinan5/zjs/tensors_save_dir/cpp/timestep_proj_cpp.pt");
+    torch::save(
+        encoder_hidden_states_embedded.contiguous().to(torch::kFloat32).cpu(),
+        "/home/weinan5/zjs/tensors_save_dir/cpp/context_cpp.pt");
+
+    if (timestep_proj.dim() == 4) {
+      // Already [B, seq_len, 6, dim] — no reshape needed
+    } else if (ts_seq_len.has_value() && ts_seq_len.value() > 1) {
       timestep_proj =
           timestep_proj.view({batch_size, ts_seq_len.value(), 6, -1});
     } else {
       timestep_proj = timestep_proj.view({batch_size, 6, -1});
     }
-
-    torch::save(timestep_proj.contiguous(),
-                "/home/weinan5/zjs/tensors_save_dir/cpp/timestep_proj_cpp.pt");
+    // torch::save(timestep_proj.contiguous(),
+    // "/home/weinan5/zjs/tensors_save_dir/cpp/timestep_proj_cpp.pt");
+    // torch::save(timestep_proj.contiguous(),
+    // "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
+    // "timestep_proj_cpp.pt");
 
     if (encoder_hidden_states_image_embedded.defined()) {
       encoder_hidden_states_embedded =
@@ -1837,7 +1881,8 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                                           hidden_states,
                                           encoder_hidden_states_embedded,
                                           timestep_proj,
-                                          rotary_emb);
+                                          rotary_emb,
+                                          save_idx);
     }
 
     LOG(INFO) << "0429 zhubowei 1";
@@ -1858,24 +1903,30 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     shift = shift.to(hidden_states.device());
     scale = scale.to(hidden_states.device());
 
-    // [BF16_NORM] 不再上转到 FP32，匹配 Python autocast 行为
-    // shift = shift.to(torch::kFloat32);
-    // scale = scale.to(torch::kFloat32);
-
-    // [SAVE_REDUCE] 注释非关键 save
-    // torch::save(shift.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/shift_cpp.pt");
-    // torch::save(scale.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/scale_cpp.pt");
+    // torch::save(shift.contiguous(), "/home/weinan5/zjs/tensors_save_dir/cpp/"
+    // + idx_tag(save_idx) + "shift_cpp.pt"); torch::save(scale.contiguous(),
+    // "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
+    // "scale_cpp.pt");
     LOG(INFO) << "0429 zhubowei 2";
-    hidden_states = (norm_out_->forward(hidden_states) * (1 + scale) + shift);
+    {
+      auto norm_result = norm_out_->forward_fp32(hidden_states);
+      // torch::save(norm_result.contiguous(),
+      //             "/home/weinan5/zjs/tensors_save_dir/cpp/" +
+      //             idx_tag(save_idx) + "norm_only_cpp.pt");
+      // Match Python autocast: scale is BF16, (1 + scale) computed in BF16,
+      // then promoted
+      auto one_plus_scale =
+          (1 + scale.to(hidden_states.dtype())).to(torch::kFloat32);
+      auto shift_fp32 = shift.to(torch::kFloat32);
+      auto norm_out = norm_result * one_plus_scale + shift_fp32;
+      // torch::save(norm_out.contiguous(),
+      //             "/home/weinan5/zjs/tensors_save_dir/cpp/" +
+      //             idx_tag(save_idx) + "norm_out_cpp.pt");
+      hidden_states = norm_out.to(hidden_states.dtype());
+    }
     LOG(INFO) << "0429 zhubowei 3";
-    // torch::save(hidden_states.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/norm_out_cpp.pt");
 
     hidden_states = proj_out_->forward(hidden_states);
-    // torch::save(hidden_states.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/head_output_cpp.pt");
     LOG(INFO) << "0429 zhubowei 4";
     hidden_states = hidden_states.view({batch_size,
                                         post_patch_num_frames,
@@ -1887,9 +1938,9 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                                         -1});
     hidden_states = hidden_states.permute({0, 7, 1, 4, 2, 5, 3, 6});
     hidden_states = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3);
-    torch::save(
-        hidden_states.cpu().contiguous(),
-        "/home/weinan5/zjs/tensors_save_dir/cpp/final_transformer_cpp.pt");
+    // torch::save(hidden_states.cpu().contiguous(),
+    // "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
+    // "final_transformer_cpp.pt");
     return hidden_states;
   }
 

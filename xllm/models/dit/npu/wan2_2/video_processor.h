@@ -1,4 +1,4 @@
-/* Copyright 2025 The xLLM Authors. All Rights Reserved.
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -156,7 +156,7 @@ class VideoProcessorImpl : public VAEImageProcessorImpl {
         reshaped,
         torch::nn::functional::InterpolateFuncOptions()
             .size(std::vector<int64_t>{resized_height, resized_width})
-            .mode(torch::kBilinear)
+            .mode(torch::kBicubic)
             .align_corners(false));
 
     int64_t start_x = (resized_width - new_width) / 2;

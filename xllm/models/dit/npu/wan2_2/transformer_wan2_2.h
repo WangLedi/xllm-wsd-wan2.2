@@ -274,9 +274,7 @@ class WanGELUImpl : public torch::nn::Module {
     proj_ = register_module("proj", proj);
   }
 
-  torch::Tensor forward(const torch::Tensor& hidden_states_in,
-                        const std::string& save_prefix = "",
-                        int& save_idx = *new int(0)) {
+  torch::Tensor forward(const torch::Tensor& hidden_states_in) {
     torch::Tensor hidden_states = proj_->forward(hidden_states_in);
     if (approximate_) {
       hidden_states = torch::gelu(hidden_states, "tanh");
@@ -366,10 +364,8 @@ class WanFeedForwardImpl : public torch::nn::Module {
     }
   }
 
-  torch::Tensor forward(const torch::Tensor& hidden_states,
-                        const std::string& save_prefix = "",
-                        int& save_idx = *new int(0)) {
-    auto output = act_fn_->forward(hidden_states, save_prefix, save_idx);
+  torch::Tensor forward(const torch::Tensor& hidden_states) {
+    auto output = act_fn_->forward(hidden_states);
     output = dropout_->forward(output);
     output = proj_out_->forward(output);
     if (final_dropout_) {
@@ -599,9 +595,7 @@ class WanAttentionImpl : public torch::nn::Module {
       const torch::Tensor& hidden_states_in,
       const torch::Tensor& encoder_hidden_states = torch::Tensor(),
       std::optional<std::pair<torch::Tensor, torch::Tensor>> rotary_emb =
-          std::nullopt,
-      const std::string& save_prefix = "",
-      int& save_idx = *new int(0)) {
+          std::nullopt) {
     torch::Tensor hidden_states = hidden_states_in;
     bool is_self_attention =
         !encoder_hidden_states.defined() ||
@@ -1165,20 +1159,14 @@ class WanTransformerBlockImpl : public torch::nn::Module {
                                std::sqrt(static_cast<float>(dim_)));
   }
 
-  torch::Tensor forward(bool is_cfg,
-                        const torch::Tensor& hidden_states_in,
+  torch::Tensor forward(const torch::Tensor& hidden_states_in,
                         const torch::Tensor& encoder_hidden_states,
                         const torch::Tensor& timestep_proj,
                         std::optional<std::pair<torch::Tensor, torch::Tensor>>
-                            rotary_emb = std::nullopt,
-                        int& save_idx = *new int(0)) {
+                            rotary_emb = std::nullopt) {
     torch::Tensor hidden_states = hidden_states_in;
     torch::Tensor shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa,
         c_gate_msa;
-
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " enter forward,
-    // hidden_states shape="
-    //           << hidden_states.sizes() << " dtype=" << hidden_states.dtype();
 
     if (timestep_proj.dim() == 4) {
       auto scale_shift =
@@ -1203,38 +1191,13 @@ class WanTransformerBlockImpl : public torch::nn::Module {
       c_gate_msa = splits[5];
     }
 
-    // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " after scale_shift
-    // split";
-
-    // if (block_idx_ >= 6 && block_idx_ <= 9) {
-    // auto gate_stats = [](const torch::Tensor& t, const std::string& name) {
-    // auto abs_t = t.to(torch::kFloat32).abs();
-    // LOG(INFO) << "[DIAG] " << name << " shape=" << t.sizes()
-    // << " mean=" << t.to(torch::kFloat32).mean().item<float>()
-    // << " absmax=" << abs_t.max().item<float>()
-    // << " absmean=" << abs_t.mean().item<float>();
-    // };
-    // gate_stats(gate_msa, "gate_msa");
-    // gate_stats(c_gate_msa, "c_gate_msa");
-    // gate_stats(scale_msa, "scale_msa");
-    // gate_stats(shift_msa, "shift_msa");
-    // gate_stats(c_scale_msa, "c_scale_msa");
-    // gate_stats(c_shift_msa, "c_shift_msa");
-    // }
-
-    std::string save_dir = "/export/home/weinan5/zjs/tensors_save_dir/cpp";
-
     torch::Tensor norm1_result = norm1_->forward(hidden_states);
 
     torch::Tensor norm_hidden_states =
         (norm1_result.to(hidden_states.dtype()) * (1 + scale_msa) + shift_msa);
 
-    std::string attn1_save_prefix = std::to_string(block_idx_);
-    torch::Tensor attn_output = attn1_->forward(norm_hidden_states,
-                                                norm_hidden_states,
-                                                rotary_emb,
-                                                attn1_save_prefix,
-                                                save_idx);
+    torch::Tensor attn_output =
+        attn1_->forward(norm_hidden_states, norm_hidden_states, rotary_emb);
 
     hidden_states = hidden_states + attn_output * gate_msa;
 
@@ -1244,11 +1207,8 @@ class WanTransformerBlockImpl : public torch::nn::Module {
       norm_hidden_states = hidden_states;
     }
 
-    attn_output = attn2_->forward(norm_hidden_states,
-                                  encoder_hidden_states,
-                                  std::nullopt,
-                                  std::to_string(block_idx_),
-                                  save_idx);
+    attn_output = attn2_->forward(
+        norm_hidden_states, encoder_hidden_states, std::nullopt);
 
     hidden_states = hidden_states + attn_output;
 
@@ -1256,9 +1216,7 @@ class WanTransformerBlockImpl : public torch::nn::Module {
 
     norm_hidden_states = (norm2_result * (1 + c_scale_msa) + c_shift_msa);
 
-    std::string ff_save_prefix = "_layer_" + std::to_string(block_idx_);
-    torch::Tensor ff_output =
-        ff_->forward(norm_hidden_states, ff_save_prefix, save_idx);
+    torch::Tensor ff_output = ff_->forward(norm_hidden_states);
 
     hidden_states = hidden_states + ff_output * c_gate_msa;
 
@@ -1287,20 +1245,6 @@ class WanTransformerBlockImpl : public torch::nn::Module {
     ff_->verify_loaded_weights(prefix + "ffn.");
     CHECK(scale_shift_table_loaded_) << "scale_shift_table is not loaded for "
                                      << prefix + "scale_shift_table";
-  }
-
-  /// @brief Replace scale_shift_table with an FP32 copy (used after model-wide
-  /// BF16 cast). After this->to(BF16), scale_shift_table_ is BF16 in-place. We
-  /// just reassign the member — forward() reads the member, not
-  /// named_parameters(), so this is sufficient for inference.
-  void set_scale_shift_table(const torch::Tensor& fp32_table) {
-    scale_shift_table_ = fp32_table;
-  }
-
-  /// @brief Get the scale_shift_table tensor (for FP32 save/restore before BF16
-  /// cast).
-  torch::Tensor scale_shift_table_clone() const {
-    return scale_shift_table_.clone();
   }
 
  private:
@@ -1452,14 +1396,12 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
 
     for (int64_t i = 0; i < transformer_layers_.size(); ++i) {
       hidden_states =
-          transformer_layers_[i]->forward(is_cfg,
-                                          hidden_states,
+          transformer_layers_[i]->forward(hidden_states,
                                           encoder_hidden_states_embedded,
                                           timestep_proj,
                                           rotary_emb);
     }
 
-    LOG(INFO) << "0429 zhubowei 1";
     torch::Tensor shift, scale;
     if (temb.dim() == 3) {
       auto scale_shift =
@@ -1477,14 +1419,12 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     shift = shift.to(hidden_states.device());
     scale = scale.to(hidden_states.device());
 
-    {
-      auto norm_result = norm_out_->forward(hidden_states, /*keep_fp32*/ true);
-      auto one_plus_scale =
-          (1 + scale.to(hidden_states.dtype())).to(torch::kFloat32);
-      auto shift_fp32 = shift.to(torch::kFloat32);
-      auto norm_out = norm_result * one_plus_scale + shift_fp32;
-      hidden_states = norm_out.to(hidden_states.dtype());
-    }
+    auto norm_result = norm_out_->forward(hidden_states, /*keep_fp32*/ true);
+    auto one_plus_scale =
+        (1 + scale.to(hidden_states.dtype())).to(torch::kFloat32);
+    auto shift_fp32 = shift.to(torch::kFloat32);
+    auto norm_out = norm_result * one_plus_scale + shift_fp32;
+    hidden_states = norm_out.to(hidden_states.dtype());
 
     hidden_states = proj_out_->forward(hidden_states);
     hidden_states = hidden_states.view({batch_size,

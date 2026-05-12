@@ -81,7 +81,7 @@ class FP32LayerNormImpl : public torch::nn::Module {
     }
   }
 
-  torch::Tensor forward(const torch::Tensor& x) {
+  torch::Tensor forward(const torch::Tensor& x, bool keep_fp32 = false) {
     auto origin_dtype = x.dtype();
     auto x_fp32 = x.to(torch::kFloat32);
     torch::Tensor result;
@@ -95,20 +95,10 @@ class FP32LayerNormImpl : public torch::nn::Module {
       result = torch::layer_norm(
           x_fp32, {normalized_shape_}, torch::nullopt, torch::nullopt, eps_);
     }
-    return result.to(origin_dtype);
-  }
-
-  torch::Tensor forward_fp32(const torch::Tensor& x) {
-    auto x_fp32 = x.to(torch::kFloat32);
-    if (elementwise_affine_) {
-      return torch::layer_norm(x_fp32,
-                               {normalized_shape_},
-                               weight_.to(torch::kFloat32),
-                               bias_.to(torch::kFloat32),
-                               eps_);
+    if (keep_fp32 == true) {
+      return result;
     }
-    return torch::layer_norm(
-        x_fp32, {normalized_shape_}, torch::nullopt, torch::nullopt, eps_);
+    return result.to(origin_dtype);
   }
 
   void load_state_dict(const StateDict& state_dict) {
@@ -287,28 +277,12 @@ class WanGELUImpl : public torch::nn::Module {
   torch::Tensor forward(const torch::Tensor& hidden_states_in,
                         const std::string& save_prefix = "",
                         int& save_idx = *new int(0)) {
-    // [BF16_MATMUL] 恢复标准 BF16 matmul，匹配 Python 的 nn.Linear
-    // FP32 matmul 虽然数学上更精确，但和 Python 的 BF16 结果不同，无法对齐
     torch::Tensor hidden_states = proj_->forward(hidden_states_in);
-    // if (!save_prefix.empty()) {
-    //   if (parallel_args_.rank_ == 0) {
-    //     torch::save(hidden_states.contiguous(),
-    //     "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
-    //     "ff_linear1" + save_prefix + "_cpp.pt");
-    //   }
-    // }
     if (approximate_) {
       hidden_states = torch::gelu(hidden_states, "tanh");
     } else {
       hidden_states = torch::gelu(hidden_states);
     }
-    // if (!save_prefix.empty()) {
-    //   if (parallel_args_.rank_ == 0) {
-    //     torch::save(hidden_states.contiguous(),
-    //     "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
-    //     "ff_gelu" + save_prefix + "_cpp.pt");
-    //   }
-    // }
     return hidden_states;
   }
 
@@ -1248,7 +1222,7 @@ class WanTransformerBlockImpl : public torch::nn::Module {
     // gate_stats(c_shift_msa, "c_shift_msa");
     // }
 
-    std::string save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+    std::string save_dir = "/export/home/weinan5/zjs/tensors_save_dir/cpp";
 
     torch::Tensor norm1_result = norm1_->forward(hidden_states);
 
@@ -1423,11 +1397,6 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
       const torch::Tensor& timestep,
       const torch::Tensor& encoder_hidden_states,
       const torch::Tensor& encoder_hidden_states_image = torch::Tensor()) {
-    LOG(INFO) << "[DIAG_FWD] enter WanTransformer3DModel forward, is_cfg="
-              << is_cfg << " hidden_states dtype=" << hidden_states_in.dtype()
-              << " encoder_hs dtype=" << encoder_hidden_states.dtype()
-              << " timestep dtype=" << timestep.dtype();
-    int save_idx = 0;
     int64_t batch_size = hidden_states_in.size(0);
     int64_t num_frames = hidden_states_in.size(2);
     int64_t height = hidden_states_in.size(3);
@@ -1444,91 +1413,19 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
 
     auto [freqs_cos, freqs_sin] = rope_->forward(hidden_states);
 
-    // ========== EXPERIMENT: Python input replacements ==========
-    // Each block can be independently enabled/disabled.
-    // Python tensors have seq_len=32132 (SP=4 padding), C++ needs 32130.
-    // We truncate .slice(1, 0, 32130) to remove the 2 padding tokens.
-
-    // --- [EXP 1] freqs (RoPE cos/sin) from Python --- DISABLED: inputs don't
-    // impact TP compounding test
-    // {
-    //   auto sd_freqs = StateDictFromSafeTensor::load(
-    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/freqs_0.safetensors");
-    //   int64_t target_seq = post_patch_num_frames * post_patch_height *
-    //   post_patch_width; auto py_freqs_cos =
-    //   sd_freqs->get_tensor("freqs_cos_0"); auto py_freqs_sin =
-    //   sd_freqs->get_tensor("freqs_sin_0"); if (py_freqs_cos.defined() &&
-    //   py_freqs_sin.defined()) {
-    //     // Python may have more tokens due to SP padding — truncate to match
-    //     C++ seq_len if (py_freqs_cos.size(1) > target_seq) {
-    //       py_freqs_cos = py_freqs_cos.slice(1, 0, target_seq);
-    //       py_freqs_sin = py_freqs_sin.slice(1, 0, target_seq);
-    //     }
-    //     freqs_cos =
-    //     py_freqs_cos.to(hidden_states.device()).to(torch::kFloat32);
-    //     freqs_sin =
-    //     py_freqs_sin.to(hidden_states.device()).to(torch::kFloat32);
-    //     LOG(INFO) << "[EXP1] Loaded RoPE freqs from Python, shape=" <<
-    //     freqs_cos.sizes();
-    //   } else {
-    //     LOG(WARNING) << "[EXP1] Failed to load Python RoPE freqs, using C++
-    //     computed freqs";
-    //   }
-    // }
     auto rotary_emb = std::make_pair(freqs_cos, freqs_sin);
 
-    LOG(INFO) << "[DIAG_FWD] before patch_embedding, hidden dtype="
-              << hidden_states.dtype()
-              << " weight dtype=" << patch_embedding_->weight.dtype();
     hidden_states = patch_embedding_->forward(
         hidden_states.to(patch_embedding_->weight.dtype()));
     hidden_states = hidden_states.flatten(2).transpose(1, 2);
-    LOG(INFO) << "[DIAG_FWD] after patch_embedding OK";
 
-    // --- [EXP 2] patch_embedding (hidden_states after patch_embed + flatten)
-    // ---
-    // {
-    //   auto sd = StateDictFromSafeTensor::load(
-    //       "/home/weinan5/zjs/tensors_save_dir/saved_safetensors/patch_embedding.safetensors");
-    //   auto py_patch = sd->get_tensor("patch_embedding");
-    //   if (py_patch.defined()) {
-    //     int64_t target_seq = hidden_states.size(1);  // 32130
-    //     if (py_patch.size(1) > target_seq) {
-    //       py_patch = py_patch.slice(1, 0, target_seq);
-    //     }
-    //     hidden_states =
-    //     py_patch.to(hidden_states.device()).to(hidden_states.dtype());
-    //     LOG(INFO) << "[EXP2] Replaced patch_embedding with Python tensor,
-    //     shape="
-    //               << hidden_states.sizes();
-    //   }
-    // }
-
-    // torch::save(hidden_states.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/patch_embedding_cpp.pt");
-    // torch::save(hidden_states.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
-    // "patch_embedding_cpp.pt");
-    torch::save(
-        hidden_states.contiguous().to(torch::kFloat32).cpu(),
-        "/home/weinan5/zjs/tensors_save_dir/cpp/patch_embedding_cpp.pt");
-    torch::save(freqs_cos.contiguous().to(torch::kFloat32).cpu(),
-                "/home/weinan5/zjs/tensors_save_dir/cpp/freqs_cos_cpp.pt");
-    torch::save(freqs_sin.contiguous().to(torch::kFloat32).cpu(),
-                "/home/weinan5/zjs/tensors_save_dir/cpp/freqs_sin_cpp.pt");
     torch::Tensor timestep_input = timestep;
-    // Match Python: expand timestep to seq_len for embedding computation
     int64_t ts_seq_len_val = hidden_states.size(1);
     std::optional<int64_t> ts_seq_len = ts_seq_len_val;
     if (timestep.dim() == 2) {
       timestep_input = timestep.flatten();
     }
 
-    LOG(INFO) << "[DIAG_FWD] before condition_embedder, timestep dtype="
-              << timestep_input.dtype()
-              << " encoder_hs dtype=" << encoder_hidden_states.dtype()
-              << " encoder_hs_image defined="
-              << encoder_hidden_states_image.defined();
     auto [temb,
           timestep_proj,
           encoder_hidden_states_embedded,
@@ -1559,8 +1456,7 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                                           hidden_states,
                                           encoder_hidden_states_embedded,
                                           timestep_proj,
-                                          rotary_emb,
-                                          save_idx);
+                                          rotary_emb);
     }
 
     LOG(INFO) << "0429 zhubowei 1";
@@ -1581,13 +1477,8 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     shift = shift.to(hidden_states.device());
     scale = scale.to(hidden_states.device());
 
-    // torch::save(shift.contiguous(), "/home/weinan5/zjs/tensors_save_dir/cpp/"
-    // + idx_tag(save_idx) + "shift_cpp.pt"); torch::save(scale.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
-    // "scale_cpp.pt");
-    LOG(INFO) << "0429 zhubowei 2";
     {
-      auto norm_result = norm_out_->forward_fp32(hidden_states);
+      auto norm_result = norm_out_->forward(hidden_states, /*keep_fp32*/ true);
       auto one_plus_scale =
           (1 + scale.to(hidden_states.dtype())).to(torch::kFloat32);
       auto shift_fp32 = shift.to(torch::kFloat32);
@@ -1658,32 +1549,10 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     }
     verify_loaded_weights("");
 
-    // [BF16_NORM] scale_shift_table 保持 BF16，匹配 Python 的 nn.Parameter 行为
-    // Python: modulation 是 nn.Parameter，model.to(bfloat16) 后就是 BF16
-    // C++ 之前: 保存 FP32 副本 → to(BF16) → 恢复 FP32 → forward 中 .to(BF16)
-    // 使用 这个多余的 FP32→BF16→FP32→BF16 往返引入了 Python 没有的量化误差 auto
-    // model_scale_shift_fp32 = scale_shift_table_.clone();
-    // std::vector<torch::Tensor> block_scale_shift_fp32;
-    // block_scale_shift_fp32.reserve(transformer_layers_.size());
-    // for (auto& block : transformer_layers_) {
-    //   block_scale_shift_fp32.push_back(
-    //       block->scale_shift_table_clone());
-    // }
-
-    // [ROPE_FIX] 保存 RoPE freqs 的 FP32 副本，to(BF16) 后恢复
-    // Python: freqs 是 FP32，npu_rotary_mul 在 FP32 下计算
     auto freqs_cos_fp32 = rope_->get_freqs_cos().clone();
     auto freqs_sin_fp32 = rope_->get_freqs_sin().clone();
 
     this->to(torch::kBFloat16);
-
-    // [BF16_NORM] 不再恢复 scale_shift_table 为 FP32，让它保持 BF16
-    // scale_shift_table_ = model_scale_shift_fp32;
-    // for (size_t i = 0; i < transformer_layers_.size(); ++i) {
-    //   transformer_layers_[i]->set_scale_shift_table(block_scale_shift_fp32[i]);
-    // }
-
-    // [ROPE_FIX] 恢复 RoPE freqs 为 FP32
     rope_->set_freqs_cos(freqs_cos_fp32);
     rope_->set_freqs_sin(freqs_sin_fp32);
   }

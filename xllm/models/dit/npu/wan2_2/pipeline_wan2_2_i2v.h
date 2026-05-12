@@ -174,6 +174,18 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
       latents_tensor = randn_tensor(shape, seed, options_);
     }
 
+    auto state_dict = StateDictFromSafeTensor::load(
+        "/export/home/weinan5/zjs/tensors_save_dir/saved_safetensors/"
+        "wsd_noise.safetensors");
+    auto input_random_latents = torch::ones({16, 21, 90, 68}, torch::kFloat32);
+    bool is_conv_out_weight_loaded = false;
+    weight::load_weight(
+        *state_dict, "noise", input_random_latents, is_conv_out_weight_loaded);
+
+    latents_tensor = input_random_latents.unsqueeze(0)
+                         .to(options_.device())
+                         .to(torch::kFloat32);
+
     image = image.unsqueeze(2);
     torch::Tensor video_condition;
 
@@ -604,6 +616,10 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
     prepared_latents = prepared_latents / latents_std;
     prepared_latents = prepared_latents + latents_mean;
     video = vae_->decode(prepared_latents.to(torch::kFloat32)).sample;
+
+    torch::save(
+        video.contiguous(),
+        "/export/home/weinan5/zjs/tensors_save_dir/cpp/vae_output_cpp.pt");
     video = video_processor_->postprocess_video(video);
 
     return video;

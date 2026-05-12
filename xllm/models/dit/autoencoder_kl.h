@@ -208,8 +208,6 @@ class VAEImageProcessorImpl : public torch::nn::Module {
 
     // Check if 4D tensor (batch, channel, height, width)
     auto img = orig_dim == 3 ? image.unsqueeze(0) : image;
-    torch::save(image,
-                "/home/weinan5/zjs/tensors_save_dir/cpp/before_resize_cpp.pt");
     auto resized = torch::nn::functional::interpolate(
         img,
         torch::nn::functional::InterpolateFuncOptions()
@@ -226,8 +224,6 @@ class VAEImageProcessorImpl : public torch::nn::Module {
 
     resized = input_resized.to(options_.device()).to(torch::kFloat32);
     */
-    torch::save(resized,
-                "/home/weinan5/zjs/tensors_save_dir/cpp/after_resize_cpp.pt");
     return orig_dim == 3 ? resized.squeeze(0) : resized;
   }
 

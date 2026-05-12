@@ -1,3 +1,18 @@
+/* Copyright 2026 The xLLM Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    https://github.com/jd-opensource/xllm/blob/main/LICENSE
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 #pragma once
 #include <torch/nn/modules/conv.h>
 #include <torch/nn/modules/dropout.h>
@@ -270,7 +285,6 @@ class WanUpsampleImpl : public torch::nn::Module {
       : options_(options) {}
 
   torch::Tensor forward(const torch::Tensor& x) {
-    // auto result = upsample_(x.to(torch::kFloat));
     auto result =
         torch::nn::functional::interpolate(x.to(torch::kFloat32), options_);
     return result;
@@ -1392,8 +1406,6 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
     } else {
       x = conv_out_->forward(x);
     }
-    torch::save(x,
-                "/home/weinan5/zjs/tensors_save_dir/cpp/wsd_dec_x_head_cpp.pt");
     return x;
   }
 
@@ -1401,7 +1413,6 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
     conv_in_->load_state_dict(state_dict.get_dict_with_prefix("conv_in."));
     mid_block_->load_state_dict(state_dict.get_dict_with_prefix("mid_block."));
 
-    // Safely load weights of up_blocks :
     for (size_t i = 0; i < up_blocks_->size(); ++i) {
       std::string prefix = "up_blocks." + std::to_string(i) + ".";
 
@@ -1450,13 +1461,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
       : args_(context.get_model_args()),
         device_(context.get_tensor_options().device()),
         dtype_(context.get_tensor_options().dtype().toScalarType()) {
-    LOG(INFO) << "WANVAE args: vae_in_channels=" << args_.vae_in_channels()
-              << " vae_base_dim=" << args_.vae_base_dim()
-              << " vae_z_dim=" << args_.vae_z_dim()
-              << " vae_dim_mult size=" << args_.vae_dim_mult().size()
-              << " vae_num_res_blocks=" << args_.vae_num_res_blocks()
-              << " vae_dropout=" << args_.vae_dropout()
-              << " vae_is_residual=" << args_.vae_is_residual();
     encoder_ = register_module("encoder",
                                WanVAEEncoder3D(args_.vae_in_channels(),
                                                args_.vae_base_dim(),
@@ -1468,7 +1472,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
                                                args_.vae_dropout(),
                                                args_.vae_is_residual()));
 
-    // Decoder temporal pattern is the reverse of encoder's downsample pattern
     auto decoder_temporal = args_.vae_temporal_downsample();
     std::reverse(decoder_temporal.begin(), decoder_temporal.end());
 
@@ -1512,7 +1515,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
         std::vector<torch::Tensor>(enc_conv_num_));
   }
 
-  // Encode video into latent representations
   torch::Tensor encode_(const torch::Tensor& videos) {
     auto orig_dtype = videos.dtype();
     auto x = videos.to(torch::kFloat32);
@@ -1566,7 +1568,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
     return AutoencoderKLOutput(posterior);
   }
 
-  // Decode latent representations into videos
   DecoderOutput decode_(const torch::Tensor& latents) {
     auto orig_dtype = latents.dtype();
     torch::Tensor processed_latents = latents.to(torch::kFloat32);
@@ -1576,9 +1577,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
     clear_cache();
     torch::Tensor out;
     processed_latents = post_quant_conv_(processed_latents);
-    torch::save(processed_latents.contiguous().to(torch::kFloat32).cpu(),
-                "/home/weinan5/zjs/tensors_save_dir/cpp/"
-                "wsd_dec_after_post_quant_conv_cpp.pt");
     for (int64_t i = 0; i < num_frame; ++i) {
       conv_idx_ = {0};
       if (i == 0) {
@@ -1636,45 +1634,20 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
   }
 
   void load_model(std::unique_ptr<DiTFolderLoader> loader) {
-    LOG(INFO) << "AutoencoderKLWan::load_model starting";
-    // Convert parameter tensors to FP32 BEFORE loading weights.
-    // load_weight() does weight.copy_(tensor) which quantizes FP32
-    // checkpoint data into the parameter's dtype. If parameters are
-    // BF16 (NPU default), precision is lost during copy_. Converting
-    // to FP32 first preserves the full FP32 checkpoint precision.
     encoder_->to(torch::kFloat32);
     decoder_->to(torch::kFloat32);
     quant_conv_->to(torch::kFloat32);
     post_quant_conv_->to(torch::kFloat32);
 
     for (const auto& state_dict : loader->get_state_dicts()) {
-      LOG(INFO) << "Loading encoder weights...";
       encoder_->load_state_dict(state_dict->get_dict_with_prefix("encoder."));
-      LOG(INFO) << "Loading decoder weights...";
       decoder_->load_state_dict(state_dict->get_dict_with_prefix("decoder."));
-      LOG(INFO) << "Loading quant_conv weights...";
       quant_conv_->load_state_dict(
           state_dict->get_dict_with_prefix("quant_conv."));
-      LOG(INFO) << "Loading post_quant_conv weights...";
       post_quant_conv_->load_state_dict(
           state_dict->get_dict_with_prefix("post_quant_conv."));
     }
-    LOG(INFO) << "Verifying weights...";
     verify_loaded_weights("");
-    // Diagnostic: print weight dtype to verify FP32 conversion worked
-    for (const auto& p : encoder_->parameters()) {
-      LOG(INFO) << "[VAE_DTYPE] encoder param dtype=" << p.dtype();
-      break;
-    }
-    for (const auto& p : decoder_->parameters()) {
-      LOG(INFO) << "[VAE_DTYPE] decoder param dtype=" << p.dtype();
-      break;
-    }
-    for (const auto& p : quant_conv_->parameters()) {
-      LOG(INFO) << "[VAE_DTYPE] quant_conv param dtype=" << p.dtype();
-      break;
-    }
-    LOG(INFO) << "WANVAE::load_model complete";
   }
 
   void verify_loaded_weights(const std::string& prefix) {

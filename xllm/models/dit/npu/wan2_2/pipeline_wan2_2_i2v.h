@@ -549,17 +549,13 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
         }
       }
 
-      torch::Tensor noise_pred = current_model->forward(false,
-                                                        i,
-                                                        latent_model_input,
+      torch::Tensor noise_pred = current_model->forward(latent_model_input,
                                                         timestep_input,
                                                         encoded_prompt_embeds,
                                                         torch::Tensor());
       if (do_classifier_free_guidance) {
         torch::Tensor noise_uncond =
-            current_model->forward(true,
-                                   i,
-                                   latent_model_input,
+            current_model->forward(latent_model_input,
                                    timestep_input,
                                    encoded_negative_embeds,
                                    torch::Tensor());

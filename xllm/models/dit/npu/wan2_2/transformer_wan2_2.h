@@ -1335,8 +1335,6 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
   }
 
   torch::Tensor forward(
-      bool is_cfg,
-      int trans_index,
       const torch::Tensor& hidden_states_in,
       const torch::Tensor& timestep,
       const torch::Tensor& encoder_hidden_states,
@@ -1538,15 +1536,11 @@ class Wan22DiTModelImpl : public torch::nn::Module {
         register_module("wan2_2_transformer", WanTransformer3DModel(context));
   }
   torch::Tensor forward(
-      bool is_cfg,
-      int trans_idx,
       const torch::Tensor& hidden_states,
       const torch::Tensor& timestep,
       const torch::Tensor& encoder_hidden_states,
       const torch::Tensor& encoder_hidden_states_image = torch::Tensor()) {
-    return wan2_2_transformer_->forward(is_cfg,
-                                        trans_idx,
-                                        hidden_states,
+    return wan2_2_transformer_->forward(hidden_states,
                                         timestep,
                                         encoder_hidden_states,
                                         encoder_hidden_states_image);

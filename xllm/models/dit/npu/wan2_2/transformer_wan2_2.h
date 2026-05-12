@@ -650,8 +650,34 @@ class WanAttentionImpl : public torch::nn::Module {
     torch::Tensor query = to_q_->forward(hidden_states);
     torch::Tensor key = to_k_->forward(encoder_hidden_states_text);
     torch::Tensor value = to_v_->forward(encoder_hidden_states_text);
+    /*
+    if (!save_prefix.empty()) {
+      // [SAVE_REDUCE] 只保留关键 tensor 的 save，加速比对
+      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+      std::string layer_tag = "_layer_" + save_prefix;
+      if (parallel_args_.rank_ == 0) {
+        // torch::save(query.contiguous(), cpp_save_dir + "/to_q_linear_out" +
+        // layer_tag + "_cpp.pt"); torch::save(key.contiguous(), cpp_save_dir +
+        // "/to_k_linear_out" + layer_tag + "_cpp.pt");
+        // torch::save(value.contiguous(), cpp_save_dir + "/to_v_linear_out" +
+        // layer_tag + "_cpp.pt");
+      }
+    }
+    */
+
     query = std::get<0>(norm_q_->forward(query));
     key = std::get<0>(norm_k_->forward(key));
+    /*
+    if (!save_prefix.empty()) {
+      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+      std::string layer_tag = "_layer_" + save_prefix;
+      if (parallel_args_.rank_ == 0) {
+        // torch::save(query.contiguous(), cpp_save_dir + "/q_after_normq" +
+        // layer_tag + "_cpp.pt"); torch::save(key.contiguous(), cpp_save_dir +
+        // "/k_after_normk" + layer_tag + "_cpp.pt");
+      }
+    }
+    */
 
     if (FLAGS_tp_size > 1) {
       query = parallel_state::scatter(
@@ -675,6 +701,39 @@ class WanAttentionImpl : public torch::nn::Module {
       query = wan_apply_rotary_emb(query, freqs_cos, freqs_sin);
       key = wan_apply_rotary_emb(key, freqs_cos, freqs_sin);
     }
+    /*
+    if (!save_prefix.empty()) {
+      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+      std::string layer_tag = "_layer_" + save_prefix;
+
+      // [TP_DISABLED] 不需要 gather，张量已经是完整的
+      // 旧代码：
+      // torch::Tensor q_save = query;
+      // torch::Tensor k_save = key;
+      // torch::Tensor v_save = value;
+      // if (FLAGS_tp_size > 1) {
+      //   q_save = query.flatten(2, 3);
+      //   k_save = key.flatten(2, 3);
+      //   v_save = value.flatten(2, 3);
+      //   q_save = parallel_state::gather(q_save, parallel_args_.dit_tp_group_,
+      //   -1); k_save = parallel_state::gather(k_save,
+      //   parallel_args_.dit_tp_group_, -1); v_save =
+      //   parallel_state::gather(v_save, parallel_args_.dit_tp_group_, -1);
+      //   q_save = q_save.view({batch_size, -1, heads_, dim_head_});
+      //   k_save = k_save.view({batch_size, -1, heads_, dim_head_});
+      //   v_save = v_save.view({batch_size, -1, heads_, dim_head_});
+      // }
+
+      if (parallel_args_.rank_ == 0) {
+        // torch::save(query.contiguous(), cpp_save_dir +
+        // "/self_attn_q_after_rope" + layer_tag + "_cpp.pt");
+        // torch::save(key.contiguous(), cpp_save_dir +
+        // "/self_attn_k_after_rope" + layer_tag + "_cpp.pt");
+        // torch::save(value.contiguous(), cpp_save_dir +
+        // "/self_attn_v_before_attn" + layer_tag + "_cpp.pt");
+      }
+    }
+    */
 
     torch::Tensor hidden_states_img;
     if (encoder_hidden_states_img.defined()) {
@@ -766,8 +825,35 @@ class WanAttentionImpl : public torch::nn::Module {
     if (hidden_states_img.defined()) {
       hidden_states = hidden_states + hidden_states_img;
     }
+    /*
+    if (!save_prefix.empty()) {
+      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+      std::string layer_tag = "_layer_" + save_prefix;
+      // [TP_DISABLED] 不需要 gather，张量已经是完整的
+      // 旧代码：
+      // torch::Tensor attn_before_save = hidden_states;
+      // if (FLAGS_tp_size > 1) {
+      //   attn_before_save = parallel_state::gather(hidden_states,
+      //   parallel_args_.dit_tp_group_, -1);
+      // }
+      if (parallel_args_.rank_ == 0) {
+        // torch::save(hidden_states.contiguous(), cpp_save_dir +
+        // "/attn_before_o_proj" + layer_tag + "_cpp.pt");
+      }
+    }
+    */
 
     hidden_states = to_out_->forward(hidden_states);
+    /*
+    if (!save_prefix.empty()) {
+      std::string cpp_save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+      std::string layer_tag = "_layer_" + save_prefix;
+      if (parallel_args_.rank_ == 0) {
+        // torch::save(hidden_states.contiguous(), cpp_save_dir +
+        // "/attn_after_o_proj" + layer_tag + "_cpp.pt");
+      }
+    }
+    */
 
     return hidden_states;
   }
@@ -1248,7 +1334,25 @@ class WanTransformerBlockImpl : public torch::nn::Module {
     // gate_stats(c_shift_msa, "c_shift_msa");
     // }
 
-    std::string save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+    // std::string save_dir = "/home/weinan5/zjs/tensors_save_dir/cpp";
+    // std::string layer_suffix =
+    "_layer_" + std::to_string(block_idx_) + "_cpp.pt";
+
+    // [DISABLED] modulation params already verified OK
+    // if (parallel_args_.rank_ == 0) {
+    //   torch::save(scale_shift_table_.contiguous(), save_dir +
+    //   "/scale_shift_table" + layer_suffix);
+    //   torch::save(timestep_proj.contiguous(), save_dir +
+    //   "/timestep_proj_block" + layer_suffix);
+    //   torch::save(shift_msa.contiguous(), save_dir + "/shift_msa" +
+    //   layer_suffix); torch::save(scale_msa.contiguous(), save_dir +
+    //   "/scale_msa" + layer_suffix); torch::save(gate_msa.contiguous(),
+    //   save_dir + "/gate_msa" + layer_suffix);
+    //   torch::save(c_shift_msa.contiguous(), save_dir + "/c_shift_msa" +
+    //   layer_suffix); torch::save(c_scale_msa.contiguous(), save_dir +
+    //   "/c_scale_msa" + layer_suffix); torch::save(c_gate_msa.contiguous(),
+    //   save_dir + "/c_gate_msa" + layer_suffix);
+    // }
 
     torch::Tensor norm1_result = norm1_->forward(hidden_states);
 
@@ -1288,68 +1392,84 @@ class WanTransformerBlockImpl : public torch::nn::Module {
 
     hidden_states = hidden_states + ff_output * c_gate_msa;
 
-    return hidden_states;
+    auto abs_block = hidden_states.to(torch::kFloat32).abs();
+    LOG(INFO) << "[DIAG] block_" << block_idx_
+              << " block_output absmax=" << abs_block.max().item<float>()
+              << " absmean=" << abs_block.mean().item<float>();
   }
+
+  // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " before save
+  // block_output"; [SAVE_ALL] 所有层都保存
+  /*
+  if (parallel_args_.rank_ == 0) {
+    torch::save(hidden_states.contiguous(),
+                save_dir + "/block_output" + layer_suffix);
+  }
+  */
+  // LOG(INFO) << "[SAVE_DEBUG] block_" << block_idx_ << " done";
+
+  return hidden_states;
+}
 
   void load_state_dict(const StateDict& state_dict) {
-    attn1_->load_state_dict(state_dict.get_dict_with_prefix("attn1."));
-    attn2_->load_state_dict(state_dict.get_dict_with_prefix("attn2."));
-    if (cross_attn_norm_ && norm2_) {
-      norm2_->load_state_dict(state_dict.get_dict_with_prefix("norm2."));
-    }
-    ff_->load_state_dict(state_dict.get_dict_with_prefix("ffn."));
-    weight::load_weight(state_dict,
-                        "scale_shift_table",
-                        scale_shift_table_,
-                        scale_shift_table_loaded_);
+  attn1_->load_state_dict(state_dict.get_dict_with_prefix("attn1."));
+  attn2_->load_state_dict(state_dict.get_dict_with_prefix("attn2."));
+  if (cross_attn_norm_ && norm2_) {
+    norm2_->load_state_dict(state_dict.get_dict_with_prefix("norm2."));
   }
+  ff_->load_state_dict(state_dict.get_dict_with_prefix("ffn."));
+  weight::load_weight(state_dict,
+                      "scale_shift_table",
+                      scale_shift_table_,
+                      scale_shift_table_loaded_);
+}
 
-  void verify_loaded_weights(const std::string& prefix) const {
-    attn1_->verify_loaded_weights(prefix + "attn1.");
-    if (cross_attn_norm_) {
-      norm2_->verify_loaded_weights(prefix + "norm2.");
-    }
-    attn2_->verify_loaded_weights(prefix + "attn2.");
-    ff_->verify_loaded_weights(prefix + "ffn.");
-    CHECK(scale_shift_table_loaded_) << "scale_shift_table is not loaded for "
-                                     << prefix + "scale_shift_table";
+void verify_loaded_weights(const std::string& prefix) const {
+  attn1_->verify_loaded_weights(prefix + "attn1.");
+  if (cross_attn_norm_) {
+    norm2_->verify_loaded_weights(prefix + "norm2.");
   }
+  attn2_->verify_loaded_weights(prefix + "attn2.");
+  ff_->verify_loaded_weights(prefix + "ffn.");
+  CHECK(scale_shift_table_loaded_)
+      << "scale_shift_table is not loaded for " << prefix + "scale_shift_table";
+}
 
-  /// @brief Replace scale_shift_table with an FP32 copy (used after model-wide
-  /// BF16 cast). After this->to(BF16), scale_shift_table_ is BF16 in-place. We
-  /// just reassign the member — forward() reads the member, not
-  /// named_parameters(), so this is sufficient for inference.
-  void set_scale_shift_table(const torch::Tensor& fp32_table) {
-    scale_shift_table_ = fp32_table;
-  }
+/// @brief Replace scale_shift_table with an FP32 copy (used after model-wide
+/// BF16 cast). After this->to(BF16), scale_shift_table_ is BF16 in-place. We
+/// just reassign the member — forward() reads the member, not
+/// named_parameters(), so this is sufficient for inference.
+void set_scale_shift_table(const torch::Tensor& fp32_table) {
+  scale_shift_table_ = fp32_table;
+}
 
-  /// @brief Get the scale_shift_table tensor (for FP32 save/restore before BF16
-  /// cast).
-  torch::Tensor scale_shift_table_clone() const {
-    return scale_shift_table_.clone();
-  }
+/// @brief Get the scale_shift_table tensor (for FP32 save/restore before BF16
+/// cast).
+torch::Tensor scale_shift_table_clone() const {
+  return scale_shift_table_.clone();
+}
 
- private:
-  int64_t dim_;
-  int64_t ffn_dim_;
-  int64_t num_heads_;
-  float eps_;
-  int64_t added_kv_proj_dim_;
-  bool cross_attn_norm_;
-  int block_idx_ = 0;
-  std::string qk_norm_;
+private:
+int64_t dim_;
+int64_t ffn_dim_;
+int64_t num_heads_;
+float eps_;
+int64_t added_kv_proj_dim_;
+bool cross_attn_norm_;
+int block_idx_ = 0;
+std::string qk_norm_;
 
-  FP32LayerNorm norm1_{nullptr};
-  WanAttention attn1_{nullptr};
-  WanAttention attn2_{nullptr};
-  FP32LayerNorm norm2_{nullptr};
-  WanFeedForward ff_{nullptr};
-  FP32LayerNorm norm3_{nullptr};
-  torch::Tensor scale_shift_table_;
-  bool scale_shift_table_loaded_{false};
+FP32LayerNorm norm1_{nullptr};
+WanAttention attn1_{nullptr};
+WanAttention attn2_{nullptr};
+FP32LayerNorm norm2_{nullptr};
+WanFeedForward ff_{nullptr};
+FP32LayerNorm norm3_{nullptr};
+torch::Tensor scale_shift_table_;
+bool scale_shift_table_loaded_{false};
 
-  torch::TensorOptions options_;
-  ParallelArgs parallel_args_;
+torch::TensorOptions options_;
+ParallelArgs parallel_args_;
 };
 TORCH_MODULE(WanTransformerBlock);
 
@@ -1504,18 +1624,6 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     //   }
     // }
 
-    // torch::save(hidden_states.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/patch_embedding_cpp.pt");
-    // torch::save(hidden_states.contiguous(),
-    // "/home/weinan5/zjs/tensors_save_dir/cpp/" + idx_tag(save_idx) +
-    // "patch_embedding_cpp.pt");
-    torch::save(
-        hidden_states.contiguous().to(torch::kFloat32).cpu(),
-        "/home/weinan5/zjs/tensors_save_dir/cpp/patch_embedding_cpp.pt");
-    torch::save(freqs_cos.contiguous().to(torch::kFloat32).cpu(),
-                "/home/weinan5/zjs/tensors_save_dir/cpp/freqs_cos_cpp.pt");
-    torch::save(freqs_sin.contiguous().to(torch::kFloat32).cpu(),
-                "/home/weinan5/zjs/tensors_save_dir/cpp/freqs_sin_cpp.pt");
     torch::Tensor timestep_input = timestep;
     // Match Python: expand timestep to seq_len for embedding computation
     int64_t ts_seq_len_val = hidden_states.size(1);
@@ -1538,8 +1646,7 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                                      encoder_hidden_states_image,
                                      ts_seq_len);
 
-    if (timestep_proj.dim() == 4) {
-    } else if (ts_seq_len.has_value() && ts_seq_len.value() > 1) {
+    if (ts_seq_len.has_value()) {
       timestep_proj =
           timestep_proj.view({batch_size, ts_seq_len.value(), 6, -1});
     } else {

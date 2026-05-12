@@ -961,6 +961,7 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
     } else {
       x = conv_in_->forward(x);
     }
+    LOG(INFO) << "————————————————————VAEEncoder5————————————————————————";
 
     // Type-safe forward call for down_blocks_
     for (size_t i = 0; i < down_blocks_->size(); ++i) {

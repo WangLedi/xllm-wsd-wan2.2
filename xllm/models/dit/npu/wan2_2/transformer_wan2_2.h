@@ -883,18 +883,13 @@ class WanTimeTextImageEmbeddingImpl : public torch::nn::Module {
     torch::Tensor timestep_proj = timesteps_proj_->forward(timestep);
     int64_t seq_len = timestep_seq_len.value_or(1);
     if (seq_len > 1) {
-      // Match Python: expand timestep to seq_len before embeddings
       auto ts = timestep.expand({1, seq_len}).flatten();
       timestep_proj =
           timesteps_proj_->forward(ts).view({-1, seq_len, time_freq_dim_});
     }
     timestep_proj = timestep_proj.to(torch::kFloat32);
-    // Match Python autocast: sinusoidal is FP32, but autocast converts to BF16
-    // before the linear layers. C++ must do the same cast BEFORE the linear,
-    // not after, to get the same BF16 intermediate rounding.
     auto embed_dtype = encoder_hidden_states.dtype();
     torch::Tensor temb = time_embedder_->forward(timestep_proj.to(embed_dtype));
-    LOG(INFO) << "[DIAG_EMBED] temb dtype=" << temb.dtype();
     torch::Tensor timestep_proj_out =
         time_proj_->forward(act_fn_->forward(temb));
     if (seq_len > 1) {

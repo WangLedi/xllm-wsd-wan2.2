@@ -591,6 +591,39 @@ class WanAttentionImpl : public torch::nn::Module {
     }
   }
 
+  torch::Tensor at_npu_attention(const torch::Tensor& q,
+                                 const torch::Tensor& k,
+                                 const torch::Tensor& v) {
+    const auto q_t = q.transpose(1, 2);
+    const auto k_t = k.transpose(1, 2);
+    const auto v_t = v.transpose(1, 2);
+
+#if defined(USE_NPU)
+    const int64_t head_num = q_t.size(1);
+    const int64_t head_dim = q_t.size(-1);
+    const auto results = at_npu::native::custom_ops::npu_fusion_attention(
+        q_t,
+        k_t,
+        v_t,
+        head_num,
+        "BNSD",
+        torch::nullopt,
+        torch::nullopt,
+        torch::nullopt,
+        std::pow(head_dim, -0.5),
+        1.0,
+        65535,
+        65535);
+    torch::Tensor out = std::get<0>(results).transpose(1, 2);
+#else
+    const double scale = 1.0 / std::sqrt(static_cast<double>(dim_head_));
+    auto attn_weights = torch::matmul(q_t, k_t.transpose(-2, -1)) * scale;
+    attn_weights = torch::softmax(attn_weights, -1);
+    torch::Tensor out = torch::matmul(attn_weights, v_t).transpose(1, 2);
+#endif
+    return out.flatten(2, 3).to(q.dtype());
+  }
+
   torch::Tensor forward(
       const torch::Tensor& hidden_states_in,
       const torch::Tensor& encoder_hidden_states = torch::Tensor(),
@@ -658,79 +691,10 @@ class WanAttentionImpl : public torch::nn::Module {
 
       key_img = key_img.view({batch_size, -1, n_heads, dim_head_});
       value_img = value_img.view({batch_size, -1, n_heads, dim_head_});
-
-      {
-#if defined(USE_NPU)
-        auto q_t = query.transpose(1, 2);  // [B,N,S,D]
-        auto k_t = key_img.transpose(1, 2);
-        auto v_t = value_img.transpose(1, 2);
-        int64_t head_num = q_t.size(1);
-        int64_t head_dim = q_t.size(-1);
-        auto results = at_npu::native::custom_ops::npu_fusion_attention(
-            q_t,
-            k_t,
-            v_t,
-            head_num,
-            "BNSD",
-            torch::nullopt,
-            torch::nullopt,
-            torch::nullopt,
-            std::pow(head_dim, -0.5),
-            1.0,
-            65535,
-            65535);
-        hidden_states_img =
-            std::get<0>(results).transpose(1, 2);  // [B,N,S,D] -> [B,S,N,D]
-#else
-        auto q_t = query.transpose(1, 2);
-        auto k_t = key_img.transpose(1, 2);
-        auto v_t = value_img.transpose(1, 2);
-        auto scale = 1.0 / std::sqrt(static_cast<double>(dim_head_));
-        auto attn_weights = torch::matmul(q_t, k_t.transpose(-2, -1)) * scale;
-        attn_weights = torch::softmax(attn_weights, -1);
-        hidden_states_img = torch::matmul(attn_weights, v_t).transpose(1, 2);
-#endif
-      }
-      hidden_states_img = hidden_states_img.flatten(2, 3);
-      hidden_states_img = hidden_states_img.to(query.dtype());
+      hidden_states_img = at_npu_attention(query, key_img, value_img);
     }
-
-    {
-#if defined(USE_NPU)
-      auto q_t = query.transpose(1, 2);  // [B,S,N,D] -> [B,N,S,D]
-      auto k_t = key.transpose(1, 2);
-      auto v_t = value.transpose(1, 2);
-      // [DIAG] Q/K/V saves removed
-      int64_t head_num = q_t.size(1);
-      int64_t head_dim = q_t.size(-1);
-      auto results = at_npu::native::custom_ops::npu_fusion_attention(
-          q_t,
-          k_t,
-          v_t,
-          head_num,
-          "BNSD",
-          torch::nullopt,
-          torch::nullopt,
-          torch::nullopt,
-          std::pow(head_dim, -0.5),
-          1.0,
-          65535,
-          65535);
-      hidden_states =
-          std::get<0>(results).transpose(1, 2);  // [B,N,S,D] -> [B,S,N,D]
-#else
-      auto q_t = query.transpose(1, 2);
-      auto k_t = key.transpose(1, 2);
-      auto v_t = value.transpose(1, 2);
-      auto scale = 1.0 / std::sqrt(static_cast<double>(dim_head_));
-      auto attn_weights = torch::matmul(q_t, k_t.transpose(-2, -1)) * scale;
-      attn_weights = torch::softmax(attn_weights, -1);
-      hidden_states = torch::matmul(attn_weights, v_t).transpose(1, 2);
-#endif
-    }
-    hidden_states = hidden_states.flatten(2, 3);
-    hidden_states = hidden_states.to(query.dtype());
-
+    hidden_states = at_npu_attention(query, key, value);
+    ;
     if (hidden_states_img.defined()) {
       hidden_states = hidden_states + hidden_states_img;
     }

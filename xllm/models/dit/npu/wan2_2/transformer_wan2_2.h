@@ -258,7 +258,7 @@ class WanGELUImpl : public torch::nn::Module {
     if (FLAGS_tp_size > 1) {
       tp_options = TpOptions(
           /*column_parallel=*/true,
-          /*tp_rank=*/parallel_args_.rank_,
+          /*tp_rank=*/parallel_args_.dit_tp_group_->rank(),
           /*tp_size=*/FLAGS_tp_size,
           /*gather_output=*/false,
           /*need_scatter=*/false,
@@ -343,7 +343,7 @@ class WanFeedForwardImpl : public torch::nn::Module {
     if (FLAGS_tp_size > 1) {
       tp_out_options = TpOptions(
           /*column_parallel=*/false,
-          /*tp_rank=*/parallel_args_.rank_,
+          /*tp_rank=*/parallel_args_.dit_tp_group_->rank(),
           /*tp_size=*/FLAGS_tp_size,
           /*gather_output=*/true,
           /*need_scatter=*/false,
@@ -488,14 +488,14 @@ class WanAttentionImpl : public torch::nn::Module {
     if (FLAGS_tp_size > 1) {
       tp_options_qk = TpOptions(
           /*column_parallel=*/true,
-          /*tp_rank=*/parallel_args_.rank_,
+          /*tp_rank=*/parallel_args_.dit_tp_group_->rank(),
           /*tp_size=*/FLAGS_tp_size,
           /*gather_output=*/true,
           /*need_scatter=*/false,
           /*process_group=*/parallel_args_.dit_tp_group_);
       tp_options_v = TpOptions(
           /*column_parallel=*/true,
-          /*tp_rank=*/parallel_args_.rank_,
+          /*tp_rank=*/parallel_args_.dit_tp_group_->rank(),
           /*tp_size=*/FLAGS_tp_size,
           /*gather_output=*/false,
           /*need_scatter=*/false,
@@ -531,7 +531,7 @@ class WanAttentionImpl : public torch::nn::Module {
     if (FLAGS_tp_size > 1) {
       tp_to_out_options = TpOptions(
           /*column_parallel=*/false,
-          /*tp_rank=*/parallel_args_.rank_,
+          /*tp_rank=*/parallel_args_.dit_tp_group_->rank(),
           /*tp_size=*/FLAGS_tp_size,
           /*gather_output=*/true,
           /*need_scatter=*/false,
@@ -557,14 +557,14 @@ class WanAttentionImpl : public torch::nn::Module {
       if (FLAGS_tp_size > 1) {
         add_k_options = TpOptions(
             /*column_parallel=*/true,
-            /*tp_rank=*/parallel_args_.rank_,
+            /*tp_rank=*/parallel_args_.dit_tp_group_->rank(),
             /*tp_size=*/FLAGS_tp_size,
             /*gather_output=*/false,
             /*need_scatter=*/false,
             /*process_group=*/parallel_args_.dit_tp_group_);
         add_v_options = TpOptions(
             /*column_parallel=*/true,
-            /*tp_rank=*/parallel_args_.rank_,
+            /*tp_rank=*/parallel_args_.dit_tp_group_->rank(),
             /*tp_size=*/FLAGS_tp_size,
             /*gather_output=*/false,
             /*need_scatter=*/false,

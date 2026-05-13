@@ -107,8 +107,7 @@ class UniPCMultistepSchedulerImpl final : public torch::nn::Module {
       int64_t num_inference_steps,
       const torch::Device& device = torch::kCPU,
       const std::optional<std::vector<float>>& sigmas = std::nullopt,
-      const std::optional<float>& mu = std::nullopt,
-      const std::optional<float>& shift = std::nullopt) {
+      const std::optional<float>& mu = std::nullopt) {
     if (use_dynamic_shifting_ && !mu.has_value()) {
       LOG(FATAL) << "mu must be provided when use_dynamic_shifting is true";
     }
@@ -160,14 +159,12 @@ class UniPCMultistepSchedulerImpl final : public torch::nn::Module {
       if (!sigmas.has_value()) {
         double start_d = 1.0 - 1.0 / static_cast<double>(num_train_timesteps_);
         double stop_d = 0.0;
-        double shift_d = shift.has_value() ? static_cast<double>(shift.value())
-                                           : static_cast<double>(flow_shift_);
         int N = num_steps;
         std::vector<float> s_vec(N);
         for (int i = 0; i < N; ++i) {
           double s = start_d + static_cast<double>(i) / static_cast<double>(N) *
                                    (stop_d - start_d);
-          s = shift_d * s / (1.0 + (shift_d - 1.0) * s);
+          s = flow_shift_ * s / (1.0 + (flow_shift_ - 1.0) * s);
           s_vec[i] = static_cast<float>(s);
         }
         sigmas_tensor =

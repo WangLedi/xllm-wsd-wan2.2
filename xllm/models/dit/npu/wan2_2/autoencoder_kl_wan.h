@@ -367,7 +367,7 @@ class WanResampleImpl : public torch::nn::Module {
       int64_t idx = (*feat_idx)[0];
       if ((*feat_cache)[idx].numel() == 0) {
         feat_cache->at(idx) = rep_tensor_;
-        (*feat_idx)[0]++;  // Filling Rep flag
+        (*feat_idx)[0]++;
       } else {
         auto cache_x =
             x.index({torch::indexing::Slice(),

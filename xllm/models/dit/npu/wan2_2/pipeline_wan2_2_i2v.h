@@ -552,11 +552,8 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
 
       torch::Tensor noise_pred;
       torch::Tensor noise_uncond;
-      LOG(INFO) << "====================cfg_size: " << FLAGS_cfg_size
-                << " ===================";
       if (do_classifier_free_guidance) {
         if (FLAGS_cfg_size == 2) {
-          LOG(INFO) << "====================开启cfg并行===================";
           auto rank = parallel_args_.dit_cfg_group_->rank();
           if (rank == 0) {
             noise_pred = current_model->forward(latent_model_input,
@@ -575,7 +572,6 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
           noise_pred = chunks[0];
           noise_uncond = chunks[1];
         } else {
-          LOG(INFO) << "====================关闭cfg并行===================";
           noise_pred = current_model->forward(latent_model_input,
                                               timestep_input,
                                               encoded_prompt_embeds,
@@ -587,57 +583,12 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
                                                 torch::Tensor());
         }
 
-        LOG(INFO)
-            << "===========================kFloat32========================";
         noise_pred = noise_uncond.to(torch::kFloat32) +
                      static_cast<float>(current_guidance) *
                          (noise_pred.to(torch::kFloat32) -
                           noise_uncond.to(torch::kFloat32));
         noise_uncond.reset();
       }
-      /*
-      LOG(INFO) << "====================cfg_size: " << FLAGS_cfg_size << "
-      ==================="; if (FLAGS_cfg_size == 2 &&
-      do_classifier_free_guidance) { LOG(INFO) <<
-      "===========================cfg开启==========================";
-        // CFG parallel: rank 0 runs conditional, rank 1 runs unconditional
-        auto rank = parallel_args_.dit_cfg_group_->rank();
-        if (rank == 0) {
-          noise_pred = current_model->forward(latent_model_input,
-                                              timestep_input,
-                                              encoded_prompt_embeds,
-                                              torch::Tensor());
-        } else {
-          noise_pred = current_model->forward(latent_model_input,
-                                              timestep_input,
-                                              encoded_negative_embeds,
-                                              torch::Tensor());
-        }
-        auto gathered = xllm::parallel_state::gather( noise_pred,
-      parallel_args_.dit_cfg_group_, dim=0); auto chunks =
-      torch::chunk(gathered, 2, 0); auto cond_pred = chunks[0]; auto uncond_pred
-      = chunks[1]; noise_pred = uncond_pred +
-      torch::scalar_tensor(current_guidance, cond_pred.options()) * (cond_pred -
-      uncond_pred); } else { noise_pred =
-      current_model->forward(latent_model_input, timestep_input,
-                                            encoded_prompt_embeds,
-                                            torch::Tensor());
-        if (do_classifier_free_guidance) {
-
-      LOG(INFO) << "====================开启cfg并行===================";
-        torch::Tensor noise_uncond =
-            current_model->forward(latent_model_input,
-                                   timestep_input,
-                                   encoded_negative_embeds,
-                                   torch::Tensor());
-        noise_pred = noise_uncond.to(torch::kFloat32) +
-                     static_cast<float>(current_guidance) *
-                         (noise_pred.to(torch::kFloat32) -
-                          noise_uncond.to(torch::kFloat32));
-        noise_uncond.reset();
-        }
-      }
-      */
 
       auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);
       prepared_latents = prev_latents.detach();
@@ -674,7 +625,7 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
     video = vae_->decode(prepared_latents.to(torch::kFloat32)).sample;
     torch::save(
         video.contiguous(),
-        "/export/home/weinan5/zjs/tensors_save_dir/cpp/vae_output_cpp.pt");
+        "/export/home/weinan5/wsd/tensors_save_dir/cpp/vae_output_cpp.pt");
     video = video_processor_->postprocess_video(video);
 
     return video;

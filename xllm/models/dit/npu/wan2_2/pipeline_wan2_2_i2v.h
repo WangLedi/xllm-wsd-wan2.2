@@ -588,7 +588,6 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
                          (noise_pred.to(torch::kFloat32) -
                           noise_uncond.to(torch::kFloat32));
         noise_uncond.reset();
-      }
     }
 
     auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);

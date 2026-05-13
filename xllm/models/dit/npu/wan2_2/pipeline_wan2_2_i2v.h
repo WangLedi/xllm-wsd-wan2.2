@@ -588,69 +588,67 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
                          (noise_pred.to(torch::kFloat32) -
                           noise_uncond.to(torch::kFloat32));
         noise_uncond.reset();
-        }
-      }
-      */
-
-      auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);
-      prepared_latents = prev_latents.detach();
-      noise_pred.reset();
-      prev_latents = torch::Tensor();
-
-      if (latents.has_value() &&
-          prepared_latents.dtype() != latents.value().dtype()) {
-        prepared_latents = prepared_latents.to(latents.value().dtype());
       }
     }
 
-    prepared_latents = prepared_latents.to(torch::kFloat32);
+    auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);
+    prepared_latents = prev_latents.detach();
+    noise_pred.reset();
+    prev_latents = torch::Tensor();
 
-    if (expand_timesteps_) {
-      prepared_latents = (1 - first_frame_mask) * latent_condition +
-                         first_frame_mask * prepared_latents;
+    if (latents.has_value() &&
+        prepared_latents.dtype() != latents.value().dtype()) {
+      prepared_latents = prepared_latents.to(latents.value().dtype());
     }
-
-    torch::Tensor video;
-
-    torch::Tensor latents_mean =
-        torch::tensor(latents_mean_, torch::dtype(torch::kFloat32))
-            .view({1, num_channels_latents, 1, 1, 1})
-            .to(prepared_latents.device());
-    torch::Tensor latents_std_raw =
-        torch::tensor(latents_std_, torch::dtype(torch::kFloat32))
-            .view({1, num_channels_latents, 1, 1, 1})
-            .to(prepared_latents.device());
-
-    torch::Tensor latents_std = 1.0 / latents_std_raw;
-    prepared_latents = prepared_latents / latents_std;
-    prepared_latents = prepared_latents + latents_mean;
-    video = vae_->decode(prepared_latents.to(torch::kFloat32)).sample;
-    video = video_processor_->postprocess_video(video);
-
-    return video;
   }
 
- private:
-  UniPCMultistepScheduler scheduler_{nullptr};
-  AutoencoderKLWan vae_{nullptr};
-  Wan22DiTModel transformer_{nullptr};
-  Wan22DiTModel transformer_2_{nullptr};
-  UMT5EncoderModel umt5_{nullptr};
-  std::unique_ptr<Tokenizer> tokenizer_{nullptr};
-  VideoProcessor video_processor_{nullptr};
+  prepared_latents = prepared_latents.to(torch::kFloat32);
 
-  float vae_scaling_factor_;
-  float vae_shift_factor_;
-  int64_t vae_scale_factor_spatial_ = 8;
-  int64_t vae_scale_factor_temporal_ = 4;
-  float boundary_ratio_ = 0.9f;
-  bool expand_timesteps_ = false;
-  int64_t zdim_ = 16;
-  float num_train_timesteps_ = 1000.0f;
-  std::vector<double> latents_mean_;
-  std::vector<double> latents_std_;
-  torch::TensorOptions options_;
-  const ParallelArgs parallel_args_;
+  if (expand_timesteps_) {
+    prepared_latents = (1 - first_frame_mask) * latent_condition +
+                       first_frame_mask * prepared_latents;
+  }
+
+  torch::Tensor video;
+
+  torch::Tensor latents_mean =
+      torch::tensor(latents_mean_, torch::dtype(torch::kFloat32))
+          .view({1, num_channels_latents, 1, 1, 1})
+          .to(prepared_latents.device());
+  torch::Tensor latents_std_raw =
+      torch::tensor(latents_std_, torch::dtype(torch::kFloat32))
+          .view({1, num_channels_latents, 1, 1, 1})
+          .to(prepared_latents.device());
+
+  torch::Tensor latents_std = 1.0 / latents_std_raw;
+  prepared_latents = prepared_latents / latents_std;
+  prepared_latents = prepared_latents + latents_mean;
+  video = vae_->decode(prepared_latents.to(torch::kFloat32)).sample;
+  video = video_processor_->postprocess_video(video);
+
+  return video;
+}
+
+private : UniPCMultistepScheduler scheduler_{nullptr};
+AutoencoderKLWan vae_{nullptr};
+Wan22DiTModel transformer_{nullptr};
+Wan22DiTModel transformer_2_{nullptr};
+UMT5EncoderModel umt5_{nullptr};
+std::unique_ptr<Tokenizer> tokenizer_{nullptr};
+VideoProcessor video_processor_{nullptr};
+
+float vae_scaling_factor_;
+float vae_shift_factor_;
+int64_t vae_scale_factor_spatial_ = 8;
+int64_t vae_scale_factor_temporal_ = 4;
+float boundary_ratio_ = 0.9f;
+bool expand_timesteps_ = false;
+int64_t zdim_ = 16;
+float num_train_timesteps_ = 1000.0f;
+std::vector<double> latents_mean_;
+std::vector<double> latents_std_;
+torch::TensorOptions options_;
+const ParallelArgs parallel_args_;
 };
 TORCH_MODULE(Wan2_2I2VPipeline);
 

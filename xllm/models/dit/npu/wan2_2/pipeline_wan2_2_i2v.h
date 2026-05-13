@@ -584,7 +584,6 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
                                                 torch::Tensor());
         }
 
-        LOG(INFO)
         noise_pred = noise_uncond.to(torch::kFloat32) +
                      static_cast<float>(current_guidance) *
                          (noise_pred.to(torch::kFloat32) -

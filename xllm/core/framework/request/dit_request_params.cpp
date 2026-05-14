@@ -33,10 +33,10 @@ std::string generate_request_id(const std::string& prefix) {
          short_uuid.random();
 }
 
-std::pair<int, int> splitResolution(const std::string& s) {
+std::pair<int32_t, int32_t> splitResolution(const std::string& s) {
   size_t pos = s.find('*');
-  int width = std::stoi(s.substr(0, pos));
-  int height = std::stoi(s.substr(pos + 1));
+  int32_t width = std::stoi(s.substr(0, pos));
+  int32_t height = std::stoi(s.substr(pos + 1));
   return {width, height};
 }
 
@@ -177,8 +177,8 @@ void fillVideoGenerationParams(DiTGenerationParams& generation_params,
   if (params.has_true_cfg_scale()) {
     generation_params.true_cfg_scale = params.true_cfg_scale();
   }
-  if (params.has_guidence_scale_2()) {
-    generation_params.guidance_scale_2 = params.guidence_scale_2();
+  if (params.has_guidance_scale_2()) {
+    generation_params.guidance_scale_2 = params.guidance_scale_2();
   }
   if (params.has_num_videos_per_prompt()) {
     generation_params.num_videos_per_prompt =

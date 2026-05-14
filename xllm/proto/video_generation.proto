@@ -42,7 +42,7 @@ message VideoParameters {
   optional float guidance_scale = 3;
 
   // Guidance scale value for negative prompt adherence
-  optional float guidence_scale_2 = 4;  
+  optional float guidance_scale_2 = 4;  
 
   // Number of videos to generate per prompt
   optional int32 num_videos_per_prompt = 5;

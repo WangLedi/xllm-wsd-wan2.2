@@ -26,7 +26,8 @@ using VideoGenerationCall = NonStreamCall<proto::VideoGenerationRequest,
                                           proto::VideoGenerationResponse>;
 class DiTMaster;
 // Handles /v1/video/generation requests
-class VideoGenerationServiceImpl : public APIServiceImpl<VideoGenerationCall> {
+class VideoGenerationServiceImpl final
+    : public APIServiceImpl<VideoGenerationCall> {
  public:
   VideoGenerationServiceImpl(DiTMaster* master,
                              const std::vector<std::string>& models);

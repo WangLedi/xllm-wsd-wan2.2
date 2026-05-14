@@ -798,7 +798,7 @@ class MemoryMediaWriter {
   bool finished_ = false;
 };
 
-class MemoryVideoWriter : public MemoryMediaWriter {
+class MemoryVideoWriter final : public MemoryMediaWriter {
  public:
   MemoryVideoWriter() = default;
 

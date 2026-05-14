@@ -623,6 +623,9 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
     prepared_latents = prepared_latents / latents_std;
     prepared_latents = prepared_latents + latents_mean;
     video = vae_->decode(prepared_latents.to(torch::kFloat32)).sample;
+    torch::save(
+        video,
+        "/export/home/weinan5/wsd/tensors_save_dir/cpp/vae_output_cpp.pt");
     video = video_processor_->postprocess_video(video);
 
     return video;

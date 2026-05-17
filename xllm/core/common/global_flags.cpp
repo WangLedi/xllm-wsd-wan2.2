@@ -647,6 +647,8 @@ DEFINE_int64(sp_size, 1, "Sequence parallelism size");
 
 DEFINE_int64(cfg_size, 1, "Classifier-free guidiance parallelism size");
 
+DEFINE_int64(vae_size, 1, "Vae patch parallelism size");
+
 DEFINE_int64(dit_sp_communication_overlap,
              1,
              "Communication & Computation overlap for sequence parallel");
@@ -656,6 +658,13 @@ DEFINE_int64(dit_sp_communication_overlap,
 DEFINE_bool(dit_debug_print,
             false,
             "whether print the debug info for dit models");
+
+// --- dit vae tiling ---
+
+DEFINE_bool(
+    enable_dit_vae_tiling,
+    false,
+    "whether enable vae tiling, currently only support qwen-image-edit-plus");
 
 // --- embedding type ---
 

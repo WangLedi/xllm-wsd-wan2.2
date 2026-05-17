@@ -309,7 +309,11 @@ DECLARE_int64(sp_size);
 
 DECLARE_int64(cfg_size);
 
+DECLARE_int64(vae_size);
+
 DECLARE_bool(dit_debug_print);
+
+DECLARE_bool(enable_dit_vae_tiling);
 
 // --- multi-step decode config ---
 

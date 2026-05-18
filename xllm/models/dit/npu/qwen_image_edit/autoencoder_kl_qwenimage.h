@@ -1505,7 +1505,7 @@ class AutoencoderKLQwenImageImpl : public torch::nn::Module {
         static_cast<int64_t>(std::pow(2, temperal_downsample_.size()));
 
     use_slicing_ = false;
-    use_tiling_ = true;
+    use_tiling_ = false;
     tile_sample_min_height_ = 256;
     tile_sample_min_width_ = 256;
     tile_sample_stride_height_ = 192;

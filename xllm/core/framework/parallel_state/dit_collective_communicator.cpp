@@ -119,7 +119,7 @@ void DiTCollectiveCommunicator::create_process_group_by_type(
     auto local_rank = parallel_info.rank();
     auto& rank_per_group = parallel_info.rank_per_group()[group_id];
     int port_offset = group_id + 1;
-
+#if defined(USE_NPU) || defined(USE_MLU)
     *group_map_[group_type] =
         std::move(create_process_group(global_rank_,
                                        local_rank,
@@ -131,6 +131,17 @@ void DiTCollectiveCommunicator::create_process_group_by_type(
                                        group_type + "_group",
                                        device));
     process_group = (*group_map_[group_type]).get();
+#else
+    LOG(INFO) << "create_process_group function is used by DiT models, since "
+                 "the DiT communication group "
+              << "info have already been calculated by rank_generator, we only "
+                 "need to pass the "
+              << "info to create the process groups. For any device that want "
+                 "to reuse the "
+              << "function and dit process groups, please implement the "
+                 "corresponding "
+              << "ProcessGroupImpl construct function. ";
+#endif
     port_ += num_group;
   }
 }

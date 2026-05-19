@@ -48,7 +48,8 @@ DiTCollectiveCommunicator::DiTCollectiveCommunicator(int32_t global_rank,
   dit_mapping_options.dit_tp_size(dit_tp_size)
       .dit_sp_size(dit_sp_size)
       .dit_cfg_size(dit_cfg_size)
-      .dit_dp_size(dit_dp_size);
+      .dit_dp_size(dit_dp_size)
+      .dit_vae_size(dit_vae_size);
   dit_mapping_ = std::make_unique<DiTMappingNPU>(
       world_size, global_rank, dit_mapping_options);
   parallel_args_ = std::make_unique<ParallelArgs>(global_rank,

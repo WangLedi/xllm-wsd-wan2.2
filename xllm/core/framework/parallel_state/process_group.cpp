@@ -185,6 +185,20 @@ void ProcessGroup::all_to_all_single(
   }
 }
 
+void ProcessGroup::send(const torch::Tensor& tensor, int dst, int tag) {
+  CHECK(pg_ != nullptr) << "Process group is not initialized.";
+  CHECK(tensor.defined()) << "send tensor is not defined";
+  std::vector<torch::Tensor> tensors = {tensor};
+  pg_->send(tensors, dst, tag)->wait();
+}
+
+void ProcessGroup::recv(torch::Tensor& tensor, int src, int tag) {
+  CHECK(pg_ != nullptr) << "Process group is not initialized.";
+  CHECK(tensor.defined()) << "recv tensor is not defined";
+  std::vector<torch::Tensor> tensors = {tensor};
+  pg_->recv(tensors, src, tag)->wait();
+}
+
 std::unique_ptr<ProcessGroup> create_process_group(
     int32_t rank,
     int32_t world_size,

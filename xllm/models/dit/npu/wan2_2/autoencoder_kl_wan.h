@@ -33,9 +33,11 @@ limitations under the License.
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "framework/model_context.h"
+#include "models/dit/vae_spatial_parallel.h"
 #include "models/model_registry.h"
 #include "processors/input_processor.h"
 #include "processors/pywarpper_image_processor.h"
+using xllm::dit::VaeSpatialParallel;
 
 namespace xllm {
 
@@ -177,16 +179,41 @@ class WanCausalConv3DImpl : public torch::nn::Module {
 
   torch::Tensor forward(
       const torch::Tensor& x,
-      const torch::optional<torch::Tensor>& cache_x = torch::nullopt) {
+      const torch::optional<torch::Tensor>& cache_x = torch::nullopt,
+      VaeSpatialParallel* ctx = nullptr) {
     std::vector<int64_t> padding = _padding_;
     torch::Tensor input = x;
+
+    bool use_halo =
+        (ctx && ctx->is_parallel() && padding_[1] == 1 && padding_[2] == 1);
+
+    // Temporal padding (causal) — must come BEFORE halo exchange so cache
+    // and input have matching spatial dims.
     if (cache_x.has_value() && cache_x.value().defined() && padding[4] > 0) {
       torch::Tensor cache = cache_x.value().to(x.device());
       input = torch::cat({cache, input}, 2);
       padding[4] -= cache.size(2);
     }
+
+    // Spatial parallel: halo exchange for conv3d with spatial padding
+    if (use_halo) {
+      input = ctx->exchange(input, /*pad=*/true);
+    }
+
     input = torch::nn::functional::pad(
         input, torch::nn::functional::PadFuncOptions(padding));
+
+    if (use_halo) {
+      // Halo provides W neighbors but H still needs its conv padding.
+      // T padding is already handled by F::pad above.
+      return torch::nn::functional::conv3d(
+          input,
+          conv_->weight,
+          torch::nn::functional::Conv3dFuncOptions()
+              .stride(stride_)
+              .padding({0, padding_[1], 0})
+              .bias(conv_->bias));
+    }
     return conv_->forward(input);
   }
 
@@ -356,12 +383,16 @@ class WanResampleImpl : public torch::nn::Module {
   torch::Tensor forward(
       torch::Tensor x,
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
-      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
+      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr,
+      VaeSpatialParallel* ctx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
 
     auto sizes = x.sizes();
     int64_t b = sizes[0], c = sizes[1], t = sizes[2], h = sizes[3],
             w = sizes[4];
+
+    bool is_upsample = (mode_ == "upsample2d" || mode_ == "upsample3d");
+    bool is_downsample = (mode_ == "downsample2d" || mode_ == "downsample3d");
 
     if (mode_ == "upsample3d" && feat_cache) {
       int64_t idx = (*feat_idx)[0];
@@ -395,9 +426,9 @@ class WanResampleImpl : public torch::nn::Module {
               {torch::zeros_like(cache_x).to(cache_x.device()), cache_x}, 2);
         }
         if (torch::equal(rep_tensor_, feat_cache->at(idx))) {
-          x = time_conv_->forward(x);
+          x = time_conv_->forward(x, torch::nullopt, ctx);
         } else {
-          x = time_conv_->forward(x, (*feat_cache)[idx]);
+          x = time_conv_->forward(x, (*feat_cache)[idx], ctx);
         }
         (*feat_cache)[idx] = cache_x;
         (*feat_idx)[0] += 1;
@@ -420,11 +451,40 @@ class WanResampleImpl : public torch::nn::Module {
       }
     }
     t = x.size(2);
+
+    // Upsample: exchange halo columns before spatial upsampling
+    if (ctx && ctx->is_parallel() && is_upsample) {
+      x = ctx->exchange(x, /*pad=*/false);
+      w = x.size(-1);  // recalc after halo exchange changed width
+    }
+    // Downsample: merge spatial slices before spatial downsampling
+    if (ctx && ctx->is_parallel() && is_downsample) {
+      x = ctx->merge(x);
+      w = x.size(-1);  // recalc after merge: W is now global
+      h = x.size(-2);  // recalc H too (may change with 2D split)
+    }
+
     x = x.permute({0, 2, 1, 3, 4}).reshape({b * t, c, h, w});
 
     x = resample_->forward(x);
     x = x.view({b, t, x.size(1), x.size(2), x.size(3)})
             .permute({0, 2, 1, 3, 4});
+
+    // Upsample: trim excess columns introduced by halo exchange
+    if (ctx && ctx->is_parallel() && is_upsample) {
+      auto cur_w = x.size(-1);
+      if (ctx->has_left() && ctx->has_right()) {
+        x = x.index({"...", torch::indexing::Slice(2, cur_w - 2)});
+      } else if (!ctx->has_left()) {
+        x = x.index({"...", torch::indexing::Slice(0, cur_w - 2)});
+      } else {
+        x = x.index({"...", torch::indexing::Slice(2, cur_w)});
+      }
+    }
+    // Downsample: split full result back to local slices
+    if (ctx && ctx->is_parallel() && is_downsample) {
+      x = ctx->split(x);
+    }
 
     if (mode_ == "downsample3d" && feat_cache) {
       int idx = (*feat_idx)[0];
@@ -447,7 +507,9 @@ class WanResampleImpl : public torch::nn::Module {
                              torch::indexing::Slice(),
                              torch::indexing::Slice()}),
                         x},
-                       2));
+                       2),
+            torch::nullopt,
+            ctx);
         (*feat_cache)[idx] = cache_x;
         (*feat_idx)[0] += 1;
       }
@@ -528,12 +590,13 @@ class WanResidualBlockImpl : public torch::nn::Module {
   torch::Tensor forward(
       torch::Tensor x,
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
-      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
+      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr,
+      VaeSpatialParallel* ctx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
 
     torch::Tensor h;
     if (in_dim_ != out_dim_) {
-      h = conv_shortcut_->forward(x);
+      h = conv_shortcut_->forward(x, torch::nullopt, ctx);
     } else {
       h = x;
     }
@@ -562,11 +625,11 @@ class WanResidualBlockImpl : public torch::nn::Module {
                               cache_x},
                              2);
       }
-      x = conv1_->forward(x, (*feat_cache)[idx]);
+      x = conv1_->forward(x, (*feat_cache)[idx], ctx);
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      x = conv1_->forward(x);
+      x = conv1_->forward(x, torch::nullopt, ctx);
     }
 
     x = norm2_->forward(x);
@@ -596,11 +659,11 @@ class WanResidualBlockImpl : public torch::nn::Module {
                               cache_x},
                              2);
       }
-      x = conv2_->forward(x, (*feat_cache)[idx]);
+      x = conv2_->forward(x, (*feat_cache)[idx], ctx);
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      x = conv2_->forward(x);
+      x = conv2_->forward(x, torch::nullopt, ctx);
     }
 
     return x + h;
@@ -649,7 +712,7 @@ class WanAttentionBlockImpl : public torch::nn::Module {
         "proj", torch::nn::Conv2d(torch::nn::Conv2dOptions(dim, dim, 1)));
   }
 
-  torch::Tensor forward(torch::Tensor x) {
+  torch::Tensor forward(torch::Tensor x, VaeSpatialParallel* ctx = nullptr) {
     torch::Tensor identity = x;
     auto sizes = x.sizes();
     int64_t batch_size = sizes[0];
@@ -663,12 +726,32 @@ class WanAttentionBlockImpl : public torch::nn::Module {
     x = norm_->forward(x);
 
     auto qkv = to_qkv_->forward(x);
-    qkv = qkv.reshape({batch_size * time, 1, channels * 3, height * width});
-    qkv = qkv.permute({0, 1, 3, 2}).contiguous();
-    auto chunks = qkv.chunk(3, -1);
-    torch::Tensor q = chunks[0];
-    torch::Tensor k = chunks[1];
-    torch::Tensor v = chunks[2];
+
+    torch::Tensor q, k, v;
+    if (ctx && ctx->is_parallel()) {
+      // Gather K/V in spatial domain before BNSD reshape
+      auto spatial_chunks = qkv.chunk(3, 1);
+      auto k_sp = ctx->gather_full(spatial_chunks[1].unsqueeze(2)).squeeze(2);
+      auto v_sp = ctx->gather_full(spatial_chunks[2].unsqueeze(2)).squeeze(2);
+      int64_t W_global = k_sp.size(-1);
+      q = spatial_chunks[0]
+              .reshape({batch_size * time, 1, channels, height * width})
+              .permute({0, 1, 3, 2})
+              .contiguous();
+      k = k_sp.reshape({batch_size * time, 1, channels, height * W_global})
+              .permute({0, 1, 3, 2})
+              .contiguous();
+      v = v_sp.reshape({batch_size * time, 1, channels, height * W_global})
+              .permute({0, 1, 3, 2})
+              .contiguous();
+    } else {
+      qkv = qkv.reshape({batch_size * time, 1, channels * 3, height * width});
+      qkv = qkv.permute({0, 1, 3, 2}).contiguous();
+      auto chunks = qkv.chunk(3, -1);
+      q = chunks[0];
+      k = chunks[1];
+      v = chunks[2];
+    }
 
     auto results = at_npu::native::custom_ops::npu_fusion_attention(
         q,
@@ -748,17 +831,19 @@ class WanMidBlockImpl : public torch::nn::Module {
   torch::Tensor forward(
       torch::Tensor x,
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
-      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
+      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr,
+      VaeSpatialParallel* ctx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
 
-    x = resnets_[0]->as<WanResidualBlock>()->forward(x, feat_cache, feat_idx);
+    x = resnets_[0]->as<WanResidualBlock>()->forward(
+        x, feat_cache, feat_idx, ctx);
     for (size_t i = 0; i < attentions_->size(); ++i) {
       auto attn = attentions_[i]->as<WanAttentionBlock>();
       if (attn) {
-        x = attn->forward(x);
+        x = attn->forward(x, ctx);
       }
       auto resnet = resnets_[i + 1]->as<WanResidualBlock>();
-      x = resnet->forward(x, feat_cache, feat_idx);
+      x = resnet->forward(x, feat_cache, feat_idx, ctx);
     }
     return x;
   }
@@ -832,15 +917,17 @@ class WanResidualDownBlockImpl : public torch::nn::Module {
   torch::Tensor forward(
       torch::Tensor x,
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
-      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
+      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr,
+      VaeSpatialParallel* ctx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
 
     torch::Tensor x_copy = x.clone();
     for (size_t i = 0; i < resnets_->size(); ++i) {
-      x = resnets_[i]->as<WanResidualBlock>()->forward(x, feat_cache, feat_idx);
+      x = resnets_[i]->as<WanResidualBlock>()->forward(
+          x, feat_cache, feat_idx, ctx);
     }
     if (downsampler_) {
-      x = downsampler_->forward(x, feat_cache, feat_idx);
+      x = downsampler_->forward(x, feat_cache, feat_idx, ctx);
     }
     return x + avg_shortcut_->forward(x_copy);
   }
@@ -946,7 +1033,8 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
   torch::Tensor forward(
       torch::Tensor x,
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
-      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
+      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr,
+      VaeSpatialParallel* ctx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
     if (feat_cache) {
       int64_t idx = (*feat_idx)[0];
@@ -969,29 +1057,28 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
                               cache_x},
                              2);
       }
-      x = conv_in_->forward(x, (*feat_cache)[idx]);
+      x = conv_in_->forward(x, (*feat_cache)[idx], ctx);
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      x = conv_in_->forward(x);
+      x = conv_in_->forward(x, torch::nullopt, ctx);
     }
 
-    // Type-safe forward call for down_blocks_
     for (size_t i = 0; i < down_blocks_->size(); ++i) {
       if (auto res_down = down_blocks_[i]->as<WanResidualDownBlock>()) {
-        x = res_down->forward(x, feat_cache, feat_idx);
+        x = res_down->forward(x, feat_cache, feat_idx, ctx);
       } else if (auto down = down_blocks_[i]->as<WanResidualBlock>()) {
-        x = feat_cache ? down->forward(x, feat_cache, feat_idx)
-                       : down->forward(x);
+        x = feat_cache ? down->forward(x, feat_cache, feat_idx, ctx)
+                       : down->forward(x, nullptr, nullptr, ctx);
       } else if (auto attn = down_blocks_[i]->as<WanAttentionBlock>()) {
-        x = attn->forward(x);
+        x = attn->forward(x, ctx);
       } else if (auto resample = down_blocks_[i]->as<WanResample>()) {
-        x = feat_cache ? resample->forward(x, feat_cache, feat_idx)
-                       : resample->forward(x);
+        x = feat_cache ? resample->forward(x, feat_cache, feat_idx, ctx)
+                       : resample->forward(x, nullptr, nullptr, ctx);
       }
     }
 
-    x = mid_block_->forward(x, feat_cache, feat_idx);
+    x = mid_block_->forward(x, feat_cache, feat_idx, ctx);
     x = norm_out_->forward(x);
     x = nonlinearity_(x);
     if (feat_cache) {
@@ -1015,11 +1102,11 @@ class WanVAEEncoder3DImpl : public torch::nn::Module {
                               cache_x},
                              2);
       }
-      x = conv_out_->forward(x, (*feat_cache)[idx]);
+      x = conv_out_->forward(x, (*feat_cache)[idx], ctx);
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      x = conv_out_->forward(x);
+      x = conv_out_->forward(x, torch::nullopt, ctx);
     }
     return x;
   }
@@ -1117,23 +1204,26 @@ class WanResidualUpBlockImpl : public torch::nn::Module {
       torch::Tensor x,
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
       std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr,
-      bool first_chunk = false) {
+      bool first_chunk = false,
+      VaeSpatialParallel* ctx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
 
     torch::Tensor x_copy = x.clone();
     for (size_t i = 0; i < resnets_->size(); ++i) {
       if (feat_cache) {
         x = resnets_[i]->as<WanResidualBlock>()->forward(
-            x, feat_cache, feat_idx);
+            x, feat_cache, feat_idx, ctx);
       } else {
-        x = resnets_[i]->as<WanResidualBlock>()->forward(x);
+        x = resnets_[i]->as<WanResidualBlock>()->forward(
+            x, nullptr, nullptr, ctx);
       }
     }
     if (upsampler_) {
       if (feat_cache) {
-        x = upsampler_->as<WanResample>()->forward(x, feat_cache, feat_idx);
+        x = upsampler_->as<WanResample>()->forward(
+            x, feat_cache, feat_idx, ctx);
       } else {
-        x = upsampler_->as<WanResample>()->forward(x);
+        x = upsampler_->as<WanResample>()->forward(x, nullptr, nullptr, ctx);
       }
     }
     if (avg_shortcut_) {
@@ -1197,24 +1287,25 @@ class WanUpBlockImpl : public torch::nn::Module {
   torch::Tensor forward(
       torch::Tensor x,
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
-      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr) {
+      std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr,
+      VaeSpatialParallel* ctx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
 
     torch::Tensor h = x;
     for (size_t i = 0; i < resnets_->size(); ++i) {
       auto resnet = resnets_[i]->as<WanResidualBlock>();
       if (feat_cache) {
-        h = resnet->forward(h, feat_cache, feat_idx);
+        h = resnet->forward(h, feat_cache, feat_idx, ctx);
       } else {
-        h = resnet->forward(h);
+        h = resnet->forward(h, nullptr, nullptr, ctx);
       }
     }
     if (upsamplers_ && upsamplers_->size() > 0) {
       auto upsampler = upsamplers_[0]->as<WanResample>();
       if (feat_cache) {
-        h = upsampler->forward(h, feat_cache, feat_idx);
+        h = upsampler->forward(h, feat_cache, feat_idx, ctx);
       } else {
-        h = upsampler->forward(h);
+        h = upsampler->forward(h, nullptr, nullptr, ctx);
       }
     }
     return h;
@@ -1330,7 +1421,8 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
       torch::Tensor x,
       std::shared_ptr<std::vector<torch::Tensor>> feat_cache = nullptr,
       std::shared_ptr<std::vector<int64_t>> feat_idx = nullptr,
-      bool first_chunk = false) {
+      bool first_chunk = false,
+      VaeSpatialParallel* ctx = nullptr) {
     if (!feat_idx) feat_idx = std::make_shared<std::vector<int64_t>>(1, 0);
 
     // conv_in
@@ -1355,22 +1447,22 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
                               cache_x},
                              2);
       }
-      x = conv_in_->forward(x, (*feat_cache)[idx]);
+      x = conv_in_->forward(x, (*feat_cache)[idx], ctx);
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      x = conv_in_->forward(x);
+      x = conv_in_->forward(x, torch::nullopt, ctx);
     }
 
     // mid_block
-    x = mid_block_->forward(x, feat_cache, feat_idx);
+    x = mid_block_->forward(x, feat_cache, feat_idx, ctx);
 
     // up_blocks : pass 'first_chunk'  to WanResidualUpBlock
     for (size_t i = 0; i < up_blocks_->size(); ++i) {
       if (auto res_up = up_blocks_[i]->as<WanResidualUpBlock>()) {
-        x = res_up->forward(x, feat_cache, feat_idx, first_chunk);
+        x = res_up->forward(x, feat_cache, feat_idx, first_chunk, ctx);
       } else if (auto up = up_blocks_[i]->as<WanUpBlock>()) {
-        x = up->forward(x, feat_cache, feat_idx);
+        x = up->forward(x, feat_cache, feat_idx, ctx);
       }
     }
 
@@ -1400,11 +1492,11 @@ class WanVAEDecoder3DImpl : public torch::nn::Module {
              cache_x},
             2);
       }
-      x = conv_out_->forward(x, (*feat_cache)[idx]);
+      x = conv_out_->forward(x, (*feat_cache)[idx], ctx);
       (*feat_cache)[idx] = cache_x;
       (*feat_idx)[0] += 1;
     } else {
-      x = conv_out_->forward(x);
+      x = conv_out_->forward(x, torch::nullopt, ctx);
     }
     return x;
   }
@@ -1518,9 +1610,10 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
   torch::Tensor encode_(const torch::Tensor& videos) {
     auto orig_dtype = videos.dtype();
     auto x = videos.to(torch::kFloat32);
+    if (is_parallel()) {
+      x = parallel_ctx_->split(x);
+    }
     int64_t num_frame = x.size(2);
-    int64_t height = x.size(3);
-    int64_t width = x.size(4);
     int64_t iter_ = 1 + (num_frame - 1) / 4;
     clear_cache();
     torch::Tensor out;
@@ -1535,7 +1628,8 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
                                 torch::indexing::Slice(0, 1),
                                 torch::indexing::Slice(),
                                 torch::indexing::Slice()});
-        out = encoder_(x_slice, enc_feat_map_, enc_conv_idx_);
+        out = encoder_(
+            x_slice, enc_feat_map_, enc_conv_idx_, parallel_ctx_.get());
       } else {
         int64_t start = 1 + 4 * (i - 1);
         int64_t end = std::min(1 + 4 * i, num_frame);
@@ -1544,11 +1638,15 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
                                 torch::indexing::Slice(start, end),
                                 torch::indexing::Slice(),
                                 torch::indexing::Slice()});
-        auto out_ = encoder_(x_slice, enc_feat_map_, enc_conv_idx_);
+        auto out_ = encoder_(
+            x_slice, enc_feat_map_, enc_conv_idx_, parallel_ctx_.get());
         out = torch::cat({out, out_}, 2);
       }
     }
     out = quant_conv_(out);
+    if (is_parallel()) {
+      out = parallel_ctx_->merge(out);
+    }
     clear_cache();
     return out.to(orig_dtype);
   }
@@ -1571,9 +1669,10 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
   DecoderOutput decode_(const torch::Tensor& latents) {
     auto orig_dtype = latents.dtype();
     torch::Tensor processed_latents = latents.to(torch::kFloat32);
+    if (is_parallel()) {
+      processed_latents = parallel_ctx_->split(processed_latents);
+    }
     int64_t num_frame = processed_latents.size(2);
-    int64_t height = processed_latents.size(3);
-    int64_t width = processed_latents.size(4);
     clear_cache();
     torch::Tensor out;
     processed_latents = post_quant_conv_(processed_latents);
@@ -1586,7 +1685,11 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
                                      torch::indexing::Slice(i, i + 1),
                                      torch::indexing::Slice(),
                                      torch::indexing::Slice()});
-        out = decoder_(x_slice, feat_map_, conv_idx_, true);  // first_chunk
+        out = decoder_(x_slice,
+                       feat_map_,
+                       conv_idx_,
+                       true,
+                       parallel_ctx_.get());  // first_chunk
       } else {
         auto x_slice =
             processed_latents.index({torch::indexing::Slice(),
@@ -1594,9 +1697,13 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
                                      torch::indexing::Slice(i, i + 1),
                                      torch::indexing::Slice(),
                                      torch::indexing::Slice()});
-        auto out_ = decoder_(x_slice, feat_map_, conv_idx_);
+        auto out_ =
+            decoder_(x_slice, feat_map_, conv_idx_, false, parallel_ctx_.get());
         out = torch::cat({out, out_}, 2);
       }
+    }
+    if (is_parallel()) {
+      out = parallel_ctx_->merge(out);
     }
     auto dec = torch::clamp(out, -1.0f, 1.0f);
 
@@ -1650,6 +1757,16 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
     verify_loaded_weights("");
   }
 
+  void set_parallel_ctx(std::unique_ptr<VaeSpatialParallel> ctx) {
+    parallel_ctx_ = std::move(ctx);
+  }
+
+  VaeSpatialParallel* parallel_ctx() const { return parallel_ctx_.get(); }
+
+  bool is_parallel() const {
+    return parallel_ctx_ && parallel_ctx_->is_parallel();
+  }
+
   void verify_loaded_weights(const std::string& prefix) {
     encoder_->verify_loaded_weights("encoder.");
     decoder_->verify_loaded_weights("decoder.");
@@ -1679,6 +1796,8 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
   int64_t enc_conv_num_ = 0;
   std::shared_ptr<std::vector<int64_t>> enc_conv_idx_;
   std::shared_ptr<std::vector<torch::Tensor>> enc_feat_map_;
+
+  std::unique_ptr<VaeSpatialParallel> parallel_ctx_;
 
   void init_cached_conv_count() {
     int decoder_count = 0;

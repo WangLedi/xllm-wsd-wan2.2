@@ -45,7 +45,7 @@ class DiTCollectiveCommunicator : public CollectiveCommunicatorBase {
  private:
   int32_t port_ = 0;
   std::string host_ = "";
-  std::unique_ptr<DiTMapping> dit_mapping_{nullptr};
+  std::unique_ptr<DiTMappingNPU> dit_mapping_{nullptr};
   std::unique_ptr<ParallelArgs> parallel_args_;
   std::unique_ptr<ProcessGroup> process_group_;
   std::unique_ptr<ProcessGroup> dit_tp_group_;

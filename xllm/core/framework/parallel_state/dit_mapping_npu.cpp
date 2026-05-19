@@ -112,8 +112,8 @@ void DiTMappingNPU::validate() {
 
 void DiTMappingNPU::set_group_by_type(
     ParallelInfo& parallel_info,
-    const std::string& group_type
-        std::vector<std::vector<int32_t>> rank_per_group) {
+    const std::string& group_type,
+    std::vector<std::vector<int32_t>> rank_per_group) {
   parallel_info.rank_per_group(rank_per_group);
   auto group_size = rank_per_group[0].size();
   parallel_info.num_group(world_size_ / group_size);

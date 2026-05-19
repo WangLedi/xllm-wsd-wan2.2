@@ -49,7 +49,7 @@ DiTCollectiveCommunicator::DiTCollectiveCommunicator(int32_t global_rank,
       .dit_sp_size(dit_sp_size)
       .dit_cfg_size(dit_cfg_size)
       .dit_dp_size(dit_dp_size);
-  dit_mapping_npu_ = std::make_unique<DiTMappingNPU>(
+  dit_mapping_ = std::make_unique<DiTMappingNPU>(
       world_size, global_rank, dit_mapping_options);
   parallel_args_ = std::make_unique<ParallelArgs>(global_rank,
                                                   world_size,
@@ -59,14 +59,7 @@ DiTCollectiveCommunicator::DiTCollectiveCommunicator(int32_t global_rank,
                                                   dit_cfg_size,
                                                   dit_vae_size,
                                                   /*process_group=*/nullptr);
-  DiTMapping::Options dit_mapping_options;
-  dit_mapping_options.dit_tp_size(dit_tp_size)
-      .dit_sp_size(dit_sp_size)
-      .dit_cfg_size(dit_cfg_size)
-      .dit_dp_size(dit_dp_size)
-      .dit_vae_size(dit_vae_size);
-  dit_mapping_ = std::make_unique<DiTMapping>(
-      world_size, global_rank, dit_mapping_options);
+#endif
 }
 
 void DiTCollectiveCommunicator::create_process_groups(

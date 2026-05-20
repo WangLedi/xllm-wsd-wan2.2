@@ -73,7 +73,7 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
     register_module("video_processor_", video_processor_);
 
     // Initialize VAE spatial parallel context
-    int vae_parallel_size = parallel_args_.vae_size();
+    int64_t vae_parallel_size = parallel_args_.vae_size();
     if (vae_parallel_size > 1) {
       auto* pg = parallel_args_.dit_vae_group_;
       CHECK(pg != nullptr)

@@ -16,6 +16,8 @@ limitations under the License.
 #include "add_matmul.h"
 
 #include "core/framework/state_dict/utils.h"
+#include "core/layers/common/quant_linear_helpers.h"
+#include "kernels/ops_api.h"
 
 namespace xllm {
 namespace layer {
@@ -105,7 +107,24 @@ AddMatmulWeightTransposedImpl::AddMatmulWeightTransposedImpl(
     const torch::TensorOptions& options)
     : AddMatmulImpl(in, out, with_bias, options) {}
 
+AddMatmulWeightTransposedImpl::AddMatmulWeightTransposedImpl(
+    int64_t in,
+    int64_t out,
+    bool with_bias,
+    const torch::TensorOptions& options,
+    const QuantArgs& quant_args)
+    : AddMatmulImpl(in, out, with_bias, options),
+      quant_args_(quant_args),
+      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {}
+
 torch::Tensor AddMatmulWeightTransposedImpl::forward(const torch::Tensor& x) {
+  if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
+        << "weight_scale is required for w8a8_dynamic quant matmul.";
+    auto bias = with_bias_ ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+    return npu_w8a8_dynamic_linear_forward(
+        x, weight_, weight_scale_, bias, output_dtype_);
+  }
   // use addmm when bias is provided
   if (with_bias_) {
     auto sizes = x.sizes();
@@ -123,15 +142,53 @@ torch::Tensor AddMatmulWeightTransposedImpl::forward(const torch::Tensor& x) {
 
 void AddMatmulWeightTransposedImpl::load_state_dict(
     const StateDict& state_dict) {
-  // only transpoes weights when state_dict has the key
-  // or it would be transposed multiple times when having
-  // multiple state dicts
-  if (state_dict.has("weight")) {
-    xllm::weight::load_weight(state_dict, "weight", weight_, weight_is_loaded_);
-    // weight need to be transposed when using addmm
-    if (with_bias_) {
-      torch::Tensor transposed = weight_.data().transpose(0, 1).contiguous();
-      weight_.set_data(transposed);
+  // Resolve quant method from quant_descs (no-op if quant_args_ is empty).
+  resolve_weight_quant_method_for_linear_load(
+      quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
+
+  // Lazy quant param registration / fallback to FP16.
+  if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    // Ensure weight_scale is registered for dynamic quantization.
+    if (!weight_scale_.defined()) {
+      std::vector<weight::LazyParameterSpec> specs;
+      specs.push_back(
+          weight::LazyParameterSpec{&weight_scale_,
+                                    &weight_scale_is_loaded_,
+                                    "weight_scale",
+                                    {weight_.size(0)},
+                                    options_.dtype(torch::kFloat32)});
+      weight::ensure_parameter_storage(this, specs);
+    }
+  } else if (!quant_args_.quant_descs().empty()) {
+    // quant_descs is non-empty but this layer wasn't resolved to a quant type.
+    // Re-register weight back to original dtype so checkpoint weights load.
+    std::vector<weight::LazyParameterSpec> specs;
+    specs.push_back(
+        weight::LazyParameterSpec{&weight_,
+                                  &weight_is_loaded_,
+                                  "weight",
+                                  {weight_.size(0), weight_.size(1)},
+                                  options_});
+    weight::ensure_parameter_storage(this, specs);
+  }
+
+  if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
+    // Load int8 weight and per-channel scale (no transpose for quant path).
+    if (state_dict.has("weight")) {
+      weight::load_weight(state_dict, "weight", weight_, weight_is_loaded_);
+    }
+    if (state_dict.has("weight_scale")) {
+      weight::load_weight(
+          state_dict, "weight_scale", weight_scale_, weight_scale_is_loaded_);
+    }
+  } else {
+    // Original FP16 load path with optional transpose for addmm.
+    if (state_dict.has("weight")) {
+      weight::load_weight(state_dict, "weight", weight_, weight_is_loaded_);
+      if (with_bias_) {
+        torch::Tensor transposed = weight_.data().transpose(0, 1).contiguous();
+        weight_.set_data(transposed);
+      }
     }
   }
   if (with_bias_) {

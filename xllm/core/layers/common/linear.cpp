@@ -18,6 +18,10 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <algorithm>
+#include <cctype>
+
+#include "core/layers/common/quant_linear_helpers.h"
 #include "framework/parallel_state/parallel_args.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "kernels/ops_api.h"
@@ -176,6 +180,68 @@ torch::Tensor fp8_linear_forward(
   matmul_params.input_shape = input.sizes().vec();
 
   return xllm::kernel::fp8_scaled_matmul(matmul_params);
+}
+
+bool tensors_allclose_as_fp32(const torch::Tensor& lhs,
+                              const torch::Tensor& rhs) {
+  return torch::allclose(lhs.to(torch::kFloat32), rhs.to(torch::kFloat32));
+}
+
+bool load_shared_tensor_from_prefixes_or_fail(
+    const StateDict& state_dict,
+    const std::vector<std::string>& prefixes,
+    const std::string& name,
+    torch::Tensor& tensor,
+    bool& tensor_is_loaded) {
+  // W8A8 fused input_scale/offset shoul be same
+  if (tensor_is_loaded || !tensor.defined()) {
+    return tensor_is_loaded;
+  }
+  torch::Tensor first_candidate;
+  std::string first_prefix;
+  for (const auto& prefix : prefixes) {
+    auto candidate = state_dict.get_tensor(prefix + name);
+    if (!candidate.defined()) {
+      continue;
+    }
+    auto flattened = candidate.flatten();
+    if (!first_candidate.defined()) {
+      first_candidate = flattened;
+      first_prefix = prefix;
+      continue;
+    }
+    CHECK_EQ(flattened.sizes(), first_candidate.sizes())
+        << "Shared tensor size for " << name << ": prefix '" << prefix
+        << "' has shape " << flattened.sizes() << ", but prefix '"
+        << first_prefix << "' has shape " << first_candidate.sizes() << ".";
+    CHECK(tensors_allclose_as_fp32(flattened, first_candidate))
+        << "Shared tensor value for " << name << ": prefix '" << prefix
+        << "' differs from prefix '" << first_prefix << "'.";
+  }
+  if (!first_candidate.defined()) {
+    return false;
+  }
+  CHECK_EQ(first_candidate.numel(), tensor.numel())
+      << "Tensor size mismatch for shared: " << state_dict.prefix() << name;
+  tensor.copy_(first_candidate.view(tensor.sizes()));
+  tensor_is_loaded = true;
+  return true;
+}
+
+void collapse_shared_tensor_to_scalar_or_fail(torch::Tensor& tensor,
+                                              const char* name) {
+  // W8A8 fused input_scale/offset shoul be same
+  CHECK(tensor.defined()) << name << " must be defined.";
+  CHECK_GT(tensor.numel(), 0) << name << " must contain at least one element.";
+  if (tensor.numel() <= 1) {
+    return;
+  }
+  auto flattened = tensor.flatten();
+  auto first = flattened.slice(0, 0, 1).expand_as(flattened);
+  CHECK(tensors_allclose_as_fp32(flattened, first))
+      << "Shared tensor value for " << name
+      << " in fused static W8A8 should be same.";
+  tensor = tensor.flatten().slice(0, 0, 1);
 }
 
 }  // namespace

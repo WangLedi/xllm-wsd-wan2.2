@@ -19,18 +19,18 @@ limitations under the License.
 #include <cstring>
 #include <memory>
 
-#include "autoencoder_kl_wan.h"
 #include "core/framework/dit_model_loader.h"
 #include "core/framework/model_context.h"
 #include "core/framework/request/dit_request_state.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "models/dit/autoencoders/autoencoder_kl_wan.h"
+#include "models/dit/encoders/umt5_encoder_wan.h"
+#include "models/dit/processors/vae_video_processor.h"
+#include "models/dit/schedulers/uni_pc_multi_step_scheduler.h"
+#include "models/dit/transformers/transformer_wan.h"
 #include "models/model_registry.h"
-#include "transformer_wan2_2.h"
-#include "umt5_encoder.h"
-#include "uni_pc_multi_step_scheduler.h"
-#include "video_processor.h"
 
 namespace xllm {
 

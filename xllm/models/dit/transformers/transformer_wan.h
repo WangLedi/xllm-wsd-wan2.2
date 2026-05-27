@@ -38,7 +38,7 @@ using xllm::dit::DiTParallelLinear;
 using xllm::dit::LinearType;
 using xllm::dit::TpOptions;
 #include "framework/model_context.h"
-#include "models/dit/transformer_flux.h"
+#include "models/dit/transformers/transformer_flux.h"
 #include "models/model_registry.h"
 #if defined(USE_NPU)
 #include "torch_npu/csrc/aten/CustomFunctions.h"

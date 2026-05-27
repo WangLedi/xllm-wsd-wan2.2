@@ -1521,7 +1521,7 @@ inline torch::Tensor apg_forward(const torch::Tensor& pred_cond,
 // UMT5 Text Encoder wrapper
 // ============================================================================
 
-// Wraps UMT5EncoderModel with UMT5-specific post-processing matching the
+// Wraps UMT5BaseEncoderModel with UMT5-specific post-processing matching the
 // official Python AudioDiTModel.encode_text():
 //   emb = F.layer_norm(last_hidden_state, (d_model,), eps=1e-6)
 //   first_hidden = F.layer_norm(embed_tokens(input_ids), (d_model,), eps=1e-6)
@@ -1530,7 +1530,7 @@ class UMT5TextEncoderImpl : public torch::nn::Module {
  public:
   explicit UMT5TextEncoderImpl(const ModelContext& context)
       : context_(context) {
-    umt5_ = register_module("umt5", UMT5EncoderModel(context));
+    umt5_ = register_module("umt5", UMT5BaseEncoderModel(context));
     d_model_ = context.get_model_args().d_model();
   }
 
@@ -1538,7 +1538,7 @@ class UMT5TextEncoderImpl : public torch::nn::Module {
   // input_ids: (B, S) int64
   // Returns: (B, S, d_model) float32
   torch::Tensor forward(const torch::Tensor& input_ids) {
-    // UMT5EncoderModel applies final_layer_norm internally.
+    // UMT5BaseEncoderModel applies final_layer_norm internally.
     // Apply F.layer_norm (no learnable params) to match official Python.
     torch::Tensor umt5_out = umt5_->forward(input_ids).to(torch::kFloat32);
     torch::Tensor last_hidden =
@@ -1564,7 +1564,7 @@ class UMT5TextEncoderImpl : public torch::nn::Module {
 
  private:
   ModelContext context_;
-  UMT5EncoderModel umt5_{nullptr};
+  UMT5BaseEncoderModel umt5_{nullptr};
   int64_t d_model_ = 768;
 };
 TORCH_MODULE(UMT5TextEncoder);

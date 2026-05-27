@@ -42,16 +42,16 @@ limitations under the License.
 namespace xllm {
 
 // ---------------------------------------------------------------------------
-// UMT5LayerSelfAttention
+// UMT5BaseLayerSelfAttention
 // ---------------------------------------------------------------------------
 // Unlike T5LayerSelfAttention:
 //   - has_relative_attention_bias is always true (every block owns a bias).
 //   - forward() does not accept a position_bias argument.
 //   - forward() does not return position_bias in its outputs.
 // ---------------------------------------------------------------------------
-class UMT5LayerSelfAttentionImpl : public torch::nn::Module {
+class UMT5BaseLayerSelfAttentionImpl : public torch::nn::Module {
  public:
-  explicit UMT5LayerSelfAttentionImpl(const ModelContext& context) {
+  explicit UMT5BaseLayerSelfAttentionImpl(const ModelContext& context) {
     // UMT5: every self-attention layer has its own relative_attention_bias.
     self_attention_ = register_module(
         "SelfAttention",
@@ -87,24 +87,25 @@ class UMT5LayerSelfAttentionImpl : public torch::nn::Module {
   T5Attention self_attention_{nullptr};
   T5LayerNorm layer_norm_{nullptr};
 };
-TORCH_MODULE(UMT5LayerSelfAttention);
+TORCH_MODULE(UMT5BaseLayerSelfAttention);
 
 // ---------------------------------------------------------------------------
-// UMT5Block
+// UMT5BaseBlock
 // ---------------------------------------------------------------------------
 // Unlike T5Block:
 //   - forward() does not accept or return position_bias.
-//   - Internally calls UMT5LayerSelfAttention which handles bias independently.
+//   - Internally calls UMT5BaseLayerSelfAttention which handles bias
+//   independently.
 // ---------------------------------------------------------------------------
-class UMT5BlockImpl : public torch::nn::Module {
+class UMT5BaseBlockImpl : public torch::nn::Module {
  public:
-  explicit UMT5BlockImpl(const ModelContext& context) {
+  explicit UMT5BaseBlockImpl(const ModelContext& context) {
     self_attention_ =
-        register_module("layer_0", UMT5LayerSelfAttention(context));
+        register_module("layer_0", UMT5BaseLayerSelfAttention(context));
     ff_layer_ = register_module("layer_1", T5LayerFFN(context));
   }
 
-  // Returns {hidden_states} — no position_bias, matching UMT5Block.forward.
+  // Returns {hidden_states} — no position_bias, matching UMT5BaseBlock.forward.
   std::vector<torch::Tensor> forward(
       const torch::Tensor& hidden_states,
       const std::optional<torch::Tensor>& attention_mask = std::nullopt) {
@@ -141,22 +142,22 @@ class UMT5BlockImpl : public torch::nn::Module {
     return torch::clamp(x, -clamp_val, clamp_val);
   }
 
-  UMT5LayerSelfAttention self_attention_{nullptr};
+  UMT5BaseLayerSelfAttention self_attention_{nullptr};
   T5LayerFFN ff_layer_{nullptr};
 };
-TORCH_MODULE(UMT5Block);
+TORCH_MODULE(UMT5BaseBlock);
 
 // ---------------------------------------------------------------------------
-// UMT5EncoderModel
+// UMT5BaseEncoderModel
 // ---------------------------------------------------------------------------
 // Matches HuggingFace UMT5Stack (encoder only):
 //   - All blocks have their own relative_attention_bias.
 //   - position_bias is never passed between blocks.
 //   - embed_tokens weight key: "encoder.embed_tokens.weight".
 // ---------------------------------------------------------------------------
-class UMT5EncoderModelImpl final : public torch::nn::Module {
+class UMT5BaseEncoderModelImpl final : public torch::nn::Module {
  public:
-  explicit UMT5EncoderModelImpl(const ModelContext& context) {
+  explicit UMT5BaseEncoderModelImpl(const ModelContext& context) {
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
 
@@ -168,7 +169,7 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
     blocks_ = register_module("blocks", torch::nn::ModuleList{});
     layers_.reserve(model_args.num_layers());
     for (int64_t i = 0; i < model_args.num_layers(); ++i) {
-      auto block = UMT5Block(context);
+      auto block = UMT5BaseBlock(context);
       blocks_->push_back(block);
       layers_.push_back(block);
     }
@@ -220,7 +221,7 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
       }
     }
     verify_loaded_weights();
-    LOG(INFO) << "UMT5EncoderModel loaded successfully.";
+    LOG(INFO) << "UMT5BaseEncoderModel loaded successfully.";
   }
 
   void verify_loaded_weights() const {
@@ -238,13 +239,13 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
   T5LayerNorm final_layer_norm_{nullptr};
   torch::nn::Embedding embed_tokens_{nullptr};
   bool is_embed_tokens_loaded_ = false;
-  std::vector<UMT5Block> layers_;
+  std::vector<UMT5BaseBlock> layers_;
   torch::nn::ModuleList blocks_{nullptr};
 };
-TORCH_MODULE(UMT5EncoderModel);
+TORCH_MODULE(UMT5BaseEncoderModel);
 
 // Model args for UMT5-base (google/umt5-base defaults).
-REGISTER_MODEL_ARGS(UMT5EncoderModel, [&] {
+REGISTER_MODEL_ARGS(UMT5BaseEncoderModel, [&] {
   LOAD_ARG_OR(dtype, "torch_dtype", "float32");
   LOAD_ARG_OR(model_type, "model_type", "umt5");
   LOAD_ARG_OR(vocab_size, "vocab_size", 256384);

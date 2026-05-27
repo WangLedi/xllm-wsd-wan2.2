@@ -29,14 +29,14 @@ limitations under the License.
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/state_dict/state_dict.h"
 #include "framework/model_context.h"
-#include "models/dit/t5_encoder.h"
+#include "models/dit/encoders/t5_encoder.h"
 #include "models/model_registry.h"
 #include "processors/input_processor.h"
 #include "processors/pywarpper_image_processor.h"
 #include "xllm/core/layers/common/add_matmul.h"
 
 namespace xllm {
-class UMT5LayerNormImpl : public T5LayerNormImpl {
+class UMT5WanLayerNormImpl : public T5LayerNormImpl {
  public:
   using T5LayerNormImpl::T5LayerNormImpl;
 
@@ -50,14 +50,14 @@ class UMT5LayerNormImpl : public T5LayerNormImpl {
     return weight_ * hidden_states;
   }
 };
-TORCH_MODULE(UMT5LayerNorm);
+TORCH_MODULE(UMT5WanLayerNorm);
 
-class UMT5LayerFFNImpl final : public torch::nn::Module {
+class UMT5WanLayerFFNImpl final : public torch::nn::Module {
  public:
-  explicit UMT5LayerFFNImpl(const ModelContext& context) {
+  explicit UMT5WanLayerFFNImpl(const ModelContext& context) {
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
-    layer_norm_ = register_module("layer_norm", UMT5LayerNorm(context));
+    layer_norm_ = register_module("layer_norm", UMT5WanLayerNorm(context));
     if (model_args.is_gated_act()) {
       dense_relu_dense_ =
           register_module("DenseReluDense",
@@ -89,11 +89,11 @@ class UMT5LayerFFNImpl final : public torch::nn::Module {
 
  private:
   std::shared_ptr<T5DenseInterface> dense_relu_dense_ = nullptr;
-  UMT5LayerNorm layer_norm_ = nullptr;
+  UMT5WanLayerNorm layer_norm_ = nullptr;
 };
-TORCH_MODULE(UMT5LayerFFN);
+TORCH_MODULE(UMT5WanLayerFFN);
 
-class UMT5AttentionImpl : public T5AttentionImpl {
+class UMT5WanAttentionImpl : public T5AttentionImpl {
  public:
   using T5AttentionImpl::T5AttentionImpl;
 
@@ -178,17 +178,18 @@ class UMT5AttentionImpl : public T5AttentionImpl {
  private:
   std::unordered_set<int64_t> pruned_heads_;
 };
-TORCH_MODULE(UMT5Attention);
+TORCH_MODULE(UMT5WanAttention);
 
-class UMT5LayerSelfAttentionImpl final : public torch::nn::Module {
+class UMT5WanLayerSelfAttentionImpl final : public torch::nn::Module {
  public:
-  UMT5LayerSelfAttentionImpl(const ModelContext& context,
-                             bool has_relative_attention_bias) {
+  UMT5WanLayerSelfAttentionImpl(const ModelContext& context,
+                                bool has_relative_attention_bias) {
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
-    self_attention_ = register_module(
-        "SelfAttention", UMT5Attention(context, has_relative_attention_bias));
-    layer_norm_ = register_module("layer_norm", UMT5LayerNorm(context));
+    self_attention_ =
+        register_module("SelfAttention",
+                        UMT5WanAttention(context, has_relative_attention_bias));
+    layer_norm_ = register_module("layer_norm", UMT5WanLayerNorm(context));
   }
 
   std::vector<torch::Tensor> forward(
@@ -223,20 +224,21 @@ class UMT5LayerSelfAttentionImpl final : public torch::nn::Module {
   }
 
  private:
-  UMT5Attention self_attention_ = nullptr;
-  UMT5LayerNorm layer_norm_ = nullptr;
+  UMT5WanAttention self_attention_ = nullptr;
+  UMT5WanLayerNorm layer_norm_ = nullptr;
 };
-TORCH_MODULE(UMT5LayerSelfAttention);
+TORCH_MODULE(UMT5WanLayerSelfAttention);
 
-class UMT5BlockImpl final : public torch::nn::Module {
+class UMT5WanBlockImpl final : public torch::nn::Module {
  public:
-  UMT5BlockImpl(const ModelContext& context, bool has_relative_attention_bias) {
+  UMT5WanBlockImpl(const ModelContext& context,
+                   bool has_relative_attention_bias) {
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
     self_attention_ = register_module(
         "SelfAttention",
-        UMT5LayerSelfAttention(context, has_relative_attention_bias));
-    ff_layer_ = register_module("LayerFFN", UMT5LayerFFN(context));
+        UMT5WanLayerSelfAttention(context, has_relative_attention_bias));
+    ff_layer_ = register_module("LayerFFN", UMT5WanLayerFFN(context));
   }
 
   std::vector<torch::Tensor> forward(
@@ -296,10 +298,10 @@ class UMT5BlockImpl final : public torch::nn::Module {
     return torch::clamp(x, -clamp_value, clamp_value);
   }
 
-  UMT5LayerSelfAttention self_attention_ = nullptr;
-  UMT5LayerFFN ff_layer_ = nullptr;
+  UMT5WanLayerSelfAttention self_attention_ = nullptr;
+  UMT5WanLayerFFN ff_layer_ = nullptr;
 };
-TORCH_MODULE(UMT5Block);
+TORCH_MODULE(UMT5WanBlock);
 
 class UMT5EncoderModelImpl final : public torch::nn::Module {
  public:
@@ -314,12 +316,12 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
     layers_.reserve(model_args.num_layers());
     for (int64_t i = 0; i < model_args.num_layers(); ++i) {
       bool has_relative_bias = true;
-      auto block = UMT5Block(context, has_relative_bias);
+      auto block = UMT5WanBlock(context, has_relative_bias);
       blocks_->push_back(block);
       layers_.emplace_back(block);
     }
     final_layer_norm_ =
-        register_module("final_layer_norm", UMT5LayerNorm(context));
+        register_module("final_layer_norm", UMT5WanLayerNorm(context));
   }
 
   torch::Tensor forward(
@@ -384,10 +386,10 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
   }
 
  private:
-  UMT5LayerNorm final_layer_norm_ = nullptr;
+  UMT5WanLayerNorm final_layer_norm_ = nullptr;
   torch::nn::Embedding embed_tokens_ = nullptr;
   bool is_embed_tokens_loaded_ = false;
-  std::vector<UMT5Block> layers_;
+  std::vector<UMT5WanBlock> layers_;
   torch::nn::ModuleList blocks_ = nullptr;
 };
 TORCH_MODULE(UMT5EncoderModel);

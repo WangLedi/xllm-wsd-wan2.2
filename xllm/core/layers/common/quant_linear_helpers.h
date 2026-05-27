@@ -228,7 +228,8 @@ inline torch::Tensor npu_w8a8_dynamic_linear_forward(
     const torch::Tensor& weight,
     const torch::Tensor& weight_scale,
     const std::optional<torch::Tensor>& bias,
-    at::ScalarType output_dtype) {
+    at::ScalarType output_dtype,
+    const std::optional<torch::Tensor>& weight_offset = std::nullopt) {
   kernel::NpuQuantizeParams quant_params;
   quant_params.input = input;
 
@@ -246,6 +247,9 @@ inline torch::Tensor npu_w8a8_dynamic_linear_forward(
   quant_matmul_params.scale = weight_scale;
   quant_matmul_params.pertoken_scale = pertoken_scale;
   quant_matmul_params.output_dtype = output_dtype;
+  if (weight_offset.has_value() && weight_offset->defined()) {
+    quant_matmul_params.offset = weight_offset;
+  }
   if (bias.has_value() && bias->defined()) {
     quant_matmul_params.bias = bias;
   }

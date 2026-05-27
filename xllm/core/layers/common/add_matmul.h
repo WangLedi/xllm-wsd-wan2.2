@@ -84,7 +84,9 @@ class AddMatmulWeightTransposedImpl : public AddMatmulImpl {
   QuantArgs quant_args_;
   std::optional<std::string> resolved_weight_quant_method_;
   torch::Tensor weight_scale_;
+  torch::Tensor weight_offset_;
   bool weight_scale_is_loaded_ = false;
+  bool weight_offset_is_loaded_ = false;
   at::ScalarType output_dtype_;
 };
 

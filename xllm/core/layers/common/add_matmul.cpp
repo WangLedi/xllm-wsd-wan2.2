@@ -115,15 +115,28 @@ AddMatmulWeightTransposedImpl::AddMatmulWeightTransposedImpl(
     const QuantArgs& quant_args)
     : AddMatmulImpl(in, out, with_bias, options),
       quant_args_(quant_args),
-      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {}
+      output_dtype_(c10::typeMetaToScalarType(options.dtype())) {
+  if (!quant_args_.quant_descs().empty()) {
+    // Pre-register weight as int8. During load_state_dict, if the quant
+    // method is not resolved for this layer, ensure_w8a8_params will
+    // re-register it back to the original dtype.
+    weight_ =
+        register_parameter("weight",
+                           torch::empty({out, in}, options.dtype(torch::kInt8)),
+                           /*requires_grad=*/false);
+  }
+}
 
 torch::Tensor AddMatmulWeightTransposedImpl::forward(const torch::Tensor& x) {
   if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
     CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
         << "weight_scale is required for w8a8_dynamic quant matmul.";
     auto bias = with_bias_ ? std::optional<torch::Tensor>(bias_) : std::nullopt;
+    auto w_offset = weight_offset_.defined()
+                        ? std::optional<torch::Tensor>(weight_offset_)
+                        : std::nullopt;
     return npu_w8a8_dynamic_linear_forward(
-        x, weight_, weight_scale_, bias, output_dtype_);
+        x, weight_, weight_scale_, bias, output_dtype_, w_offset);
   }
   // use addmm when bias is provided
   if (with_bias_) {
@@ -148,13 +161,19 @@ void AddMatmulWeightTransposedImpl::load_state_dict(
 
   // Lazy quant param registration / fallback to FP16.
   if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-    // Ensure weight_scale is registered for dynamic quantization.
+    // Ensure weight_scale and weight_offset are registered.
     if (!weight_scale_.defined()) {
       std::vector<weight::LazyParameterSpec> specs;
       specs.push_back(
           weight::LazyParameterSpec{&weight_scale_,
                                     &weight_scale_is_loaded_,
                                     "weight_scale",
+                                    {weight_.size(0)},
+                                    options_.dtype(torch::kFloat32)});
+      specs.push_back(
+          weight::LazyParameterSpec{&weight_offset_,
+                                    &weight_offset_is_loaded_,
+                                    "weight_offset",
                                     {weight_.size(0)},
                                     options_.dtype(torch::kFloat32)});
       weight::ensure_parameter_storage(this, specs);
@@ -173,13 +192,19 @@ void AddMatmulWeightTransposedImpl::load_state_dict(
   }
 
   if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-    // Load int8 weight and per-channel scale (no transpose for quant path).
+    // Load int8 weight, per-channel scale, and optional offset.
     if (state_dict.has("weight")) {
       weight::load_weight(state_dict, "weight", weight_, weight_is_loaded_);
     }
     if (state_dict.has("weight_scale")) {
       weight::load_weight(
           state_dict, "weight_scale", weight_scale_, weight_scale_is_loaded_);
+    }
+    if (state_dict.has("weight_offset")) {
+      weight::load_weight(state_dict,
+                          "weight_offset",
+                          weight_offset_,
+                          weight_offset_is_loaded_);
     }
   } else {
     // Original FP16 load path with optional transpose for addmm.

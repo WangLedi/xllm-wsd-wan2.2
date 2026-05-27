@@ -27,7 +27,8 @@ class DiTCollectiveCommunicator : public CollectiveCommunicatorBase {
                             int32_t dit_dp_size,
                             int32_t dit_tp_size,
                             int32_t dit_sp_size,
-                            int32_t dit_cfg_size);
+                            int32_t dit_cfg_size,
+                            int32_t dit_vae_size);
 
   ~DiTCollectiveCommunicator() = default;
 
@@ -37,14 +38,22 @@ class DiTCollectiveCommunicator : public CollectiveCommunicatorBase {
   // init communicator and return parallel args.
   const ParallelArgs* parallel_args() override;
 
+  void create_process_group_by_type(const std::string& group_type,
+                                    ProcessGroup*& process_group,
+                                    const torch::Device& device);
+
  private:
-  std::unique_ptr<DiTMappingNPU> dit_mapping_npu_{nullptr};
+  int32_t port_ = 0;
+  std::string host_ = "";
+  std::unique_ptr<DiTMappingNPU> dit_mapping_{nullptr};
   std::unique_ptr<ParallelArgs> parallel_args_;
   std::unique_ptr<ProcessGroup> process_group_;
   std::unique_ptr<ProcessGroup> dit_tp_group_;
   std::unique_ptr<ProcessGroup> dit_sp_group_;
   std::unique_ptr<ProcessGroup> dit_dp_group_;
   std::unique_ptr<ProcessGroup> dit_cfg_group_;
+  std::unique_ptr<ProcessGroup> dit_vae_group_;
+  std::unordered_map<std::string, std::unique_ptr<ProcessGroup>*> group_map_;
 };
 
 }  // namespace xllm

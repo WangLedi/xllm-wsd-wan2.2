@@ -19,6 +19,7 @@ limitations under the License.
 
 namespace xllm {
 
+bool RankGenerator::initialized_ = false;
 DiTMappingNPU::DiTMappingNPU(const int32_t world_size,
                              const int32_t rank,
                              const Options& options)
@@ -27,18 +28,26 @@ DiTMappingNPU::DiTMappingNPU(const int32_t world_size,
   sp_.backend("hccl");
   cfg_.backend("hccl");
   dp_.backend("hccl");
+  vae_.backend("hccl");
   parse_parallel_info();
   validate();
-  rank_generator_ =
-      std::make_unique<RankGenerator>(tp_.group_size(),
-                                      sp_.group_size(),
-                                      cfg_.group_size(),
-                                      dp_.group_size(),
-                                      /*group_order=*/"tp-sp-cfg-dp");
-  set_group_by_type(tp_, "tp");
-  set_group_by_type(sp_, "sp");
-  set_group_by_type(cfg_, "cfg");
-  set_group_by_type(dp_, "dp");
+  RankGenerator::init(world_size);
+  std::vector<int32_t> group_ranks = {
+      tp_.group_size(), sp_.group_size(), cfg_.group_size(), dp_.group_size()};
+  std::vector<std::string> group_order = {"tp", "sp", "cfg", "dp"};
+  auto ranks_mapping =
+      RankGenerator::getInstance().get_ranks_mapping(group_ranks, group_order);
+
+  set_group_by_type(tp_, "tp", ranks_mapping->at("tp"));
+  set_group_by_type(sp_, "sp", ranks_mapping->at("sp"));
+  set_group_by_type(cfg_, "cfg", ranks_mapping->at("cfg"));
+  set_group_by_type(dp_, "dp", ranks_mapping->at("dp"));
+
+  std::vector<int32_t> vae_group_ranks = {vae_.group_size()};
+  std::vector<std::string> vae_group_order = {"vae"};
+  auto ranks_mapping_vae = RankGenerator::getInstance().get_ranks_mapping(
+      vae_group_ranks, vae_group_order);
+  set_group_by_type(vae_, "vae", ranks_mapping_vae->at("vae"));
 }
 
 void DiTMappingNPU::parse_parallel_info() {
@@ -53,6 +62,9 @@ void DiTMappingNPU::parse_parallel_info() {
   }
   if (options_.dit_dp_size() != -1) {
     dp_.group_size(options_.dit_dp_size());
+  }
+  if (options_.dit_vae_size() != -1) {
+    vae_.group_size(options_.dit_vae_size());
   }
 }
 
@@ -78,15 +90,30 @@ void DiTMappingNPU::validate() {
              ". "
              "Please check `cfg`, `tp`, `sp`, `dp` and `world_size`.";
 
-  CHECK(cfg_.group_size() <= 2) << "cfg_size must less than 2 "
-                                   "cfg_size is " +
-                                       std::to_string(cfg_.group_size()) +
-                                       ". Please check `cfg` .";
+  CHECK(cfg_.group_size() <= 2 && cfg_.group_size() >= 1)
+      << "cfg_size must less than 2 "
+         "cfg_size is " +
+             std::to_string(cfg_.group_size()) + ". Please check `cfg` .";
+
+  CHECK(vae_.group_size() <= world_size_)
+      << "vae_size could not greater than world_size. "
+         "vae_size is " +
+             std::to_string(vae_.group_size()) + ", world_size is " +
+             std::to_string(world_size_) +
+             ". Please check `vae` and 'world_size'.";
+
+  CHECK(world_size_ % vae_.group_size() == 0)
+      << "world_size could not be divided by world_size. "
+         "vae_size is " +
+             std::to_string(vae_.group_size()) + ", world_size is " +
+             std::to_string(world_size_) +
+             ". Please check `vae` and 'world_size'.";
 }
 
-void DiTMappingNPU::set_group_by_type(ParallelInfo& parallel_info,
-                                      const std::string& group_type) {
-  auto rank_per_group = rank_generator_->get_ranks(group_type);
+void DiTMappingNPU::set_group_by_type(
+    ParallelInfo& parallel_info,
+    const std::string& group_type,
+    std::vector<std::vector<int32_t>> rank_per_group) {
   parallel_info.rank_per_group(rank_per_group);
   auto group_size = rank_per_group[0].size();
   parallel_info.num_group(world_size_ / group_size);
@@ -122,8 +149,10 @@ const ParallelInfo& DiTMappingNPU::get_parallel_info(
     return cfg_;
   } else if (group_type == "dp") {
     return dp_;
+  } else if (group_type == "vae") {
+    return vae_;
   } else {
-    LOG(ERROR) << "get unexpected group_type: " << group_type;
+    LOG(FATAL) << "get unexpected group_type: " << group_type;
   }
 }
 
@@ -139,6 +168,7 @@ nlohmann::json DiTMappingNPU::to_json() {
   data["tp"] = tp_.to_json();
   data["cfg"] = cfg_.to_json();
   data["dp"] = dp_.to_json();
+  data["vae"] = vae_.to_json();
   return data;
 }
 

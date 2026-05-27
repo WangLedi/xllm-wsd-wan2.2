@@ -34,6 +34,8 @@ class DiTMappingNPU final {
     PROPERTY(int32_t, dit_sp_size) = -1;
     // dp size
     PROPERTY(int32_t, dit_dp_size) = -1;
+    // vae size
+    PROPERTY(int32_t, dit_vae_size) = -1;
   };
 
   DiTMappingNPU(const int32_t world_size,
@@ -47,7 +49,8 @@ class DiTMappingNPU final {
   void validate();
 
   void set_group_by_type(ParallelInfo& parallel_info,
-                         const std::string& group_type);
+                         const std::string& group_type,
+                         std::vector<std::vector<int32_t>> rank_per_group);
 
   std::tuple<int32_t, int32_t> get_current_group_id(
       const std::vector<std::vector<int>>& rank_per_group,
@@ -67,6 +70,6 @@ class DiTMappingNPU final {
   ParallelInfo tp_ = ParallelInfo();
   ParallelInfo cfg_ = ParallelInfo();
   ParallelInfo dp_ = ParallelInfo();
-  std::unique_ptr<RankGenerator> rank_generator_{nullptr};
+  ParallelInfo vae_ = ParallelInfo();
 };
 }  // namespace xllm

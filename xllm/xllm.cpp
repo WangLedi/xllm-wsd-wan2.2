@@ -231,6 +231,7 @@ int run() {
       .tp_size(FLAGS_tp_size)
       .sp_size(FLAGS_sp_size)
       .cfg_size(FLAGS_cfg_size)
+      .vae_size(FLAGS_vae_size)
       .instance_name(FLAGS_host + ":" + std::to_string(FLAGS_port))
       .enable_disagg_pd(FLAGS_enable_disagg_pd)
       .enable_pd_ooc(FLAGS_enable_pd_ooc)

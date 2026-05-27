@@ -96,6 +96,12 @@ class ProcessGroup {
       bool async_op = false,
       c10::intrusive_ptr<c10d::Work>* async_work = nullptr);
 
+  // Point-to-point: send tensor to dst rank, recv tensor from src rank.
+  // Both are synchronous (block until complete).
+  // src/dst are group-local ranks.
+  virtual void send(const torch::Tensor& tensor, int dst, int tag = 0);
+  virtual void recv(torch::Tensor& tensor, int src, int tag = 0);
+
  private:
   // rank of current process.
   int32_t rank_ = 0;

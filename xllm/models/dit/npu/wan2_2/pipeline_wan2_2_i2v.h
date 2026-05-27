@@ -26,6 +26,7 @@ limitations under the License.
 #include "core/framework/state_dict/state_dict.h"
 #include "core/framework/state_dict/utils.h"
 #include "framework/parallel_state/parallel_state.h"
+#include "models/dit/vae_spatial_parallel.h"
 #include "models/model_registry.h"
 #include "transformer_wan2_2.h"
 #include "umt5_encoder.h"
@@ -70,6 +71,19 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
     register_module("umt5", umt5_);
     register_module("scheduler", scheduler_);
     register_module("video_processor_", video_processor_);
+
+    // Initialize VAE spatial parallel context
+    int64_t vae_parallel_size = parallel_args_.vae_size();
+    if (vae_parallel_size > 1) {
+      auto* pg = parallel_args_.dit_vae_group_;
+      CHECK(pg != nullptr)
+          << "dit_vae_group_ is null but vae_parallel_size > 1";
+      auto ctx = std::make_unique<dit::VaeSpatialParallel>(
+          vae_parallel_size, pg, options_.device());
+      vae_->set_parallel_ctx(std::move(ctx));
+      LOG(INFO) << "VAE spatial parallel enabled: w_split="
+                << vae_parallel_size;
+    }
   }
 
   DiTForwardOutput forward(const DiTForwardInput& input) {

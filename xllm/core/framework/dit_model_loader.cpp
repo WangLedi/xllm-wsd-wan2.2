@@ -565,6 +565,11 @@ DiTModelLoader::DiTModelLoader(const std::string& model_root_path)
       continue;
     }
 
+    if (json_value[1].is_null()) {
+      LOG(INFO) << "Skipping null component: " << json_key;
+      continue;
+    }
+
     const std::string model_type = json_value[1].get<std::string>();
     const std::string component_name = json_key;
 

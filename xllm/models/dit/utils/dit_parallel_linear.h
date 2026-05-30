@@ -291,19 +291,17 @@ class DiTParallelLinearImpl : public torch::nn::Module {
             torch::empty({out_per_partition}, tensor_options_),
             /*is_buffer=*/false);
       }
-      // Pre-allocate 1D weight_scale and weight_offset for dynamic W8A8 TP.
-      // The NPU kernel requires 1D tensors; 2D [N,1] checkpoints are reshaped
-      // during loading via reshape_quant_vector_if_compatible.
+      // Pre-allocate weight_scale and weight_offset for dynamic W8A8 TP.
       // When column-parallel, output features are sharded.
       if (!quant_args_.quant_descs().empty()) {
         tp_weight_scale_ = register_parameter(
             "weight_scale",
-            torch::empty({out_per_partition},
+            torch::empty({out_per_partition, 1},
                          tensor_options_.dtype(torch::kFloat32)),
             /*is_buffer=*/false);
         tp_weight_offset_ = register_parameter(
             "weight_offset",
-            torch::empty({out_per_partition},
+            torch::empty({out_per_partition, 1},
                          tensor_options_.dtype(torch::kFloat32)),
             /*is_buffer=*/false);
       }
@@ -330,17 +328,17 @@ class DiTParallelLinearImpl : public torch::nn::Module {
                                torch::empty({out_features_}, tensor_options_),
                                /*is_buffer=*/false);
       }
-      // Pre-allocate 1D weight_scale and weight_offset for dynamic W8A8 TP.
+      // Pre-allocate weight_scale and weight_offset for dynamic W8A8 TP.
       // When row-parallel, all output features are kept locally.
       if (!quant_args_.quant_descs().empty()) {
         tp_weight_scale_ = register_parameter(
             "weight_scale",
-            torch::empty({out_features_},
+            torch::empty({out_features_, 1},
                          tensor_options_.dtype(torch::kFloat32)),
             /*is_buffer=*/false);
         tp_weight_offset_ = register_parameter(
             "weight_offset",
-            torch::empty({out_features_},
+            torch::empty({out_features_, 1},
                          tensor_options_.dtype(torch::kFloat32)),
             /*is_buffer=*/false);
       }
@@ -459,7 +457,27 @@ class DiTParallelLinearImpl : public torch::nn::Module {
     // THIS specific layer. Only w8a8_dynamic layers get int8 weight; all
     // others keep the original dtype from init_tp_weights.
     if (layer::is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-      // Convert tp_weight from original dtype to int8.
+      if (!tp_weight_scale_.defined()) {
+        auto weight_scale_size = tp.column_parallel
+                                     ? tp_weight_.size(0)
+                                     : tp_weight_.size(0);  // out_features
+        std::vector<weight::LazyParameterSpec> specs;
+        specs.push_back(
+            weight::LazyParameterSpec{&tp_weight_scale_,
+                                      &tp_weight_scale_is_loaded_,
+                                      "weight_scale",
+                                      {weight_scale_size, 1},
+                                      tensor_options_.dtype(torch::kFloat32)});
+        specs.push_back(
+            weight::LazyParameterSpec{&tp_weight_offset_,
+                                      &tp_weight_offset_is_loaded_,
+                                      "weight_offset",
+                                      {weight_scale_size, 1},
+                                      tensor_options_.dtype(torch::kFloat32)});
+        weight::ensure_parameter_storage(this, specs);
+      }
+    } else if (!quant_args_.quant_descs().empty()) {
+      // Re-register int8 weight back to original dtype for non-quant fallback.
       std::vector<weight::LazyParameterSpec> specs;
       specs.push_back(
           weight::LazyParameterSpec{&tp_weight_,

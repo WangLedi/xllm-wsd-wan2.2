@@ -854,7 +854,6 @@ class WanAttentionImpl : public torch::nn::Module {
       to_v_->load_state_dict(state_dict.get_dict_with_prefix("to_v."));
       to_out_->load_state_dict(state_dict.get_dict_with_prefix("to_out.0."));
     }
-
     norm_q_->load_state_dict(state_dict.get_dict_with_prefix("norm_q."));
     norm_k_->load_state_dict(state_dict.get_dict_with_prefix("norm_k."));
 
@@ -923,6 +922,7 @@ class WanImageEmbeddingImpl : public torch::nn::Module {
   explicit WanImageEmbeddingImpl(const ModelContext& context)
       : options_(context.get_tensor_options()) {
     auto model_args = context.get_model_args();
+    quant_args_ = context.get_quant_args();
     auto parallel_args = context.get_parallel_args();
     in_features_ = model_args.image_embed_dim();
     out_features_ = model_args.head_dim() * model_args.n_heads();
@@ -1006,6 +1006,7 @@ class WanTimeTextImageEmbeddingImpl : public torch::nn::Module {
   explicit WanTimeTextImageEmbeddingImpl(const ModelContext& context)
       : options_(context.get_tensor_options()) {
     auto model_args = context.get_model_args();
+    quant_args_ = context.get_quant_args();
     dim_ = model_args.head_dim() * model_args.n_heads();
     time_freq_dim_ = model_args.time_freq_dim();
     time_proj_dim_ = dim_ * 6;
@@ -1148,6 +1149,7 @@ class WanRotaryPosEmbedImpl : public torch::nn::Module {
   explicit WanRotaryPosEmbedImpl(const ModelContext& context)
       : options_(context.get_tensor_options()) {
     auto model_args = context.get_model_args();
+    quant_args_ = context.get_quant_args();
     attention_head_dim_ = model_args.head_dim();
     patch_size_ = model_args.wan_patch_size();
     max_seq_len_ = model_args.rope_max_seq_len();
@@ -1254,7 +1256,6 @@ class WanRotaryPosEmbedImpl : public torch::nn::Module {
   int64_t t_dim_;
   int64_t h_dim_;
   int64_t w_dim_;
-
   // wsd
   QuantArgs quant_args_;
   torch::Tensor freqs_cos_;
@@ -1273,7 +1274,6 @@ class WanTransformerBlockImpl : public torch::nn::Module {
         parallel_args_(parallel_args),
         block_idx_(block_idx) {
     auto model_args = context.get_model_args();
-    // wsd
     quant_args_ = context.get_quant_args();
     dim_ = model_args.head_dim() * model_args.n_heads();
     ffn_dim_ = model_args.ffn_dim();
@@ -1439,7 +1439,6 @@ class WanTransformerBlockImpl : public torch::nn::Module {
   FP32LayerNorm norm3_{nullptr};
   torch::Tensor scale_shift_table_;
   bool scale_shift_table_loaded_{false};
-
   // wsd
   QuantArgs quant_args_;
   torch::TensorOptions options_;
@@ -1533,6 +1532,9 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     int64_t post_patch_height = height / p_h;
     int64_t post_patch_width = width / p_w;
 
+    LOG(INFO) << "quant_args_.quant_descs()"
+              << quant_args_.quant_descs().size();
+
     torch::Tensor hidden_states = hidden_states_in;
 
     auto [freqs_cos, freqs_sin] = rope_->forward(hidden_states);
@@ -1619,7 +1621,6 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     hidden_states = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3);
     return hidden_states;
   }
-
   void load_state_dict(const StateDict& state_dict) {
     weight::load_weight(state_dict,
                         "patch_embedding.weight",

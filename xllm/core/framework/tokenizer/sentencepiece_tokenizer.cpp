@@ -156,35 +156,48 @@ bool SentencePieceTokenizer::encode(const std::string_view& text,
   }
 
   if (special_token_regex_ == nullptr) {
-    return encode_internal(text, ids);
-  }
-
-  absl::string_view input{text.data(), text.size()};
-  absl::string_view special;
-  while (true) {
-    const auto* start = input.begin();
-    if (!re2::RE2::FindAndConsume(&input, *special_token_regex_, &special)) {
-      // no more special tokens
-      break;
-    }
-
-    // encode text before special token if exists
-    const std::string_view sub_input(start,
-                                     input.begin() - start - special.size());
-    if (!encode_internal(sub_input, ids)) {
+    if (!encode_internal(text, ids)) {
       return false;
     }
+  } else {
+    absl::string_view input{text.data(), text.size()};
+    absl::string_view special;
+    while (true) {
+      const auto* start = input.begin();
+      if (!re2::RE2::FindAndConsume(&input, *special_token_regex_, &special)) {
+        // no more special tokens
+        break;
+      }
 
-    // add special token id if exists
-    const auto sit = special_token_encoder_.find(special);
-    if (sit != special_token_encoder_.end()) {
-      // find one special token
-      ids->push_back(sit->second);
+      // encode text before special token if exists
+      const std::string_view sub_input(start,
+                                       input.begin() - start - special.size());
+      if (!encode_internal(sub_input, ids)) {
+        return false;
+      }
+
+      // add special token id if exists
+      const auto sit = special_token_encoder_.find(special);
+      if (sit != special_token_encoder_.end()) {
+        // find one special token
+        ids->push_back(sit->second);
+      }
+    }
+
+    // encode remaining text if exists
+    if (!encode_internal({input.data(), input.size()}, ids)) {
+      return false;
     }
   }
 
-  // encode remaining text if exists
-  return encode_internal({input.data(), input.size()}, ids);
+  if (add_special_tokens && !args_.eos_token().empty()) {
+    const auto eos_id = token_to_id(args_.eos_token());
+    if (eos_id.has_value() && (ids->empty() || ids->back() != eos_id.value())) {
+      ids->push_back(eos_id.value());
+    }
+  }
+
+  return true;
 }
 
 void SentencePieceTokenizer::decode_internal(const Slice<int32_t>& ids,

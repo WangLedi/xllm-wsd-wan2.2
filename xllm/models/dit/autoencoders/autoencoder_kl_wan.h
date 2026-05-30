@@ -1455,9 +1455,9 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
         device_(context.get_tensor_options().device()),
         dtype_(context.get_tensor_options().dtype().toScalarType()) {
     encoder_ = register_module("encoder",
-                               WanVAEEncoder3D(args_.vae_in_channels(),
+                               WanVAEEncoder3D(args_.in_channels(),
                                                args_.vae_base_dim(),
-                                               args_.vae_z_dim() * 2,
+                                               args_.z_dim() * 2,
                                                args_.vae_dim_mult(),
                                                args_.vae_num_res_blocks(),
                                                args_.vae_attn_scales(),
@@ -1470,13 +1470,13 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
 
     decoder_ = register_module("decoder",
                                WanVAEDecoder3D(args_.vae_base_dim(),
-                                               args_.vae_z_dim(),
+                                               args_.z_dim(),
                                                args_.vae_dim_mult(),
                                                args_.vae_num_res_blocks(),
                                                args_.vae_attn_scales(),
                                                decoder_temporal,
                                                args_.vae_dropout(),
-                                               args_.vae_out_channels(),
+                                               args_.out_channels(),
                                                args_.vae_is_residual()));
 
     quant_conv_ =
@@ -1675,7 +1675,6 @@ class AutoencoderKLWanImpl : public torch::nn::Module {
 TORCH_MODULE(AutoencoderKLWan);
 
 REGISTER_MODEL_ARGS(AutoencoderKLWan, [&] {
-  LOAD_ARG_OR(vae_z_dim, "z_dim", 16);
   LOAD_ARG_OR(z_dim, "z_dim", 16);
   LOAD_ARG_OR(vae_base_dim, "base_dim", 96);
   LOAD_ARG_OR(vae_num_res_blocks, "num_res_blocks", 2);
@@ -1685,8 +1684,8 @@ REGISTER_MODEL_ARGS(AutoencoderKLWan, [&] {
   LOAD_ARG_OR(vae_attn_scales, "attn_scales", (std::vector<double>{}));
   LOAD_ARG_OR(vae_dim_mult, "dim_mult", (std::vector<int64_t>{1, 2, 4, 4}));
   LOAD_ARG_OR(vae_dropout, "dropout", 0.0f);
-  LOAD_ARG_OR(vae_in_channels, "in_channels", 3);
-  LOAD_ARG_OR(vae_out_channels, "out_channels", 3);
+  LOAD_ARG_OR(in_channels, "in_channels", 3);
+  LOAD_ARG_OR(out_channels, "out_channels", 3);
   LOAD_ARG_OR(vae_is_residual, "is_residual", false);
   LOAD_ARG_OR(vae_scale_factor_temporal, "scale_factor_temporal", 4);
   LOAD_ARG_OR(vae_scale_factor_spatial, "scale_factor_spatial", 8);

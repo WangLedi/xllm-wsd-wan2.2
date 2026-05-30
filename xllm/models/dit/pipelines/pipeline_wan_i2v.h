@@ -26,7 +26,7 @@ limitations under the License.
 #include "core/framework/state_dict/utils.h"
 #include "framework/parallel_state/parallel_state.h"
 #include "models/dit/autoencoders/autoencoder_kl_wan.h"
-#include "models/dit/encoders/umt5_encoder_wan.h"
+#include "models/dit/encoders/umt5_encoder.h"
 #include "models/dit/processors/vae_video_processor.h"
 #include "models/dit/schedulers/uni_pc_multi_step_scheduler.h"
 #include "models/dit/transformers/transformer_wan.h"
@@ -53,7 +53,8 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
     vae_ = AutoencoderKLWan(context.get_model_context("vae"));
     transformer_ = Wan22DiTModel(context.get_model_context("transformer"));
     transformer_2_ = Wan22DiTModel(context.get_model_context("transformer_2"));
-    umt5_ = UMT5WanEncoderModel(context.get_model_context("text_encoder"));
+    umt5_ = UMT5EncoderModel(context.get_model_context("text_encoder"),
+                             /*is_wan_style=*/true);
     scheduler_ =
         UniPCMultistepScheduler(context.get_model_context("scheduler"));
     video_processor_ = VAEVideoProcessor(context.get_model_context("vae"),
@@ -202,7 +203,6 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
     torch::Tensor latent_condition;
     latent_condition = vae_->encode(video_condition).latent_dist.mode();
     latent_condition = (latent_condition - latents_mean) * latents_std;
-
     if (latent_condition.size(0) == 1 && batch_size > 1) {
       latent_condition = latent_condition.repeat({batch_size, 1, 1, 1, 1});
     }
@@ -252,7 +252,8 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
 
   torch::Tensor get_t5_prompt_embeds(std::vector<std::string>& prompt,
                                      int64_t num_videos_per_prompt = 1,
-                                     int64_t max_sequence_length = 512) {
+                                     int64_t max_sequence_length = 512,
+                                     const std::string& save_tag = "") {
     int64_t batch_size = prompt.size();
 
     std::vector<std::vector<int32_t>> text_input_ids;
@@ -329,7 +330,7 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
       prompt_embeds_tensor = prompt_embeds.value();
     } else if (prompt.has_value()) {
       prompt_embeds_tensor = get_t5_prompt_embeds(
-          prompt.value(), num_videos_per_prompt, max_sequence_length);
+          prompt.value(), num_videos_per_prompt, max_sequence_length, "_pos");
     }
 
     int64_t batch_size;
@@ -345,13 +346,14 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
         negative_prompt_embeds_tensor =
             get_t5_prompt_embeds(negative_prompt.value(),
                                  num_videos_per_prompt,
-                                 max_sequence_length);
+                                 max_sequence_length,
+                                 "_neg");
       } else if (negative_prompt_embeds.has_value()) {
         negative_prompt_embeds_tensor = negative_prompt_embeds.value();
       } else {
         std::vector<std::string> empty_prompt = {""};
         negative_prompt_embeds_tensor = get_t5_prompt_embeds(
-            empty_prompt, num_videos_per_prompt, max_sequence_length);
+            empty_prompt, num_videos_per_prompt, max_sequence_length, "_neg");
       }
     }
     return {prompt_embeds_tensor, negative_prompt_embeds_tensor};
@@ -419,7 +421,6 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
                       do_classifier_free_guidance,
                       num_videos_per_prompt,
                       max_sequence_length);
-
     scheduler_->set_timesteps(num_inference_steps,
                               options_.device(),
                               /*sigmas*/ std::nullopt,
@@ -436,8 +437,8 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
                    << "Using blank white image as fallback.";
       input_image = torch::ones({3, height, width}, torch::kFloat32);
     }
-    torch::Tensor preprocessed_image =
-        video_processor_->preprocess(input_image, height, width);
+    torch::Tensor preprocessed_image = video_processor_->preprocess(
+        input_image, height, width, "bicubic_no_aa");
     preprocessed_image =
         preprocessed_image.to(options_.device(), torch::kFloat32);
 
@@ -471,6 +472,7 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
     float boundary_timestep =
         boundary_ratio_ > 0.0f ? boundary_ratio_ * num_train_timesteps_ : -1.0f;
 
+    bool first_step = true;
     for (int64_t i = 0; i < timesteps.numel(); ++i) {
       torch::Tensor t = timesteps[i];
       int64_t total_steps = timesteps.numel();
@@ -514,7 +516,6 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
           timestep_input = t.expand(prepared_latents.size(0));
         }
       }
-
       torch::Tensor noise_pred;
       torch::Tensor noise_uncond;
       if (do_classifier_free_guidance) {
@@ -554,9 +555,11 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
                           noise_uncond.to(torch::kFloat32));
         noise_uncond.reset();
       }
-
       auto prev_latents = scheduler_->step(noise_pred, t, prepared_latents);
       prepared_latents = prev_latents.detach();
+      if (first_step) {
+        first_step = false;
+      }
       noise_pred.reset();
       prev_latents = torch::Tensor();
 
@@ -654,7 +657,7 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
   AutoencoderKLWan vae_{nullptr};
   Wan22DiTModel transformer_{nullptr};
   Wan22DiTModel transformer_2_{nullptr};
-  UMT5WanEncoderModel umt5_{nullptr};
+  UMT5EncoderModel umt5_{nullptr};
   std::unique_ptr<Tokenizer> tokenizer_{nullptr};
   VAEVideoProcessor video_processor_{nullptr};
 

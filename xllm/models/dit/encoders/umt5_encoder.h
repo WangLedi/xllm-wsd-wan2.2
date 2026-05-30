@@ -111,11 +111,11 @@ class UMT5BlockImpl : public torch::nn::Module {
       const std::optional<torch::Tensor>& attention_mask = std::nullopt) {
     torch::Tensor curr =
         self_attention_->forward(hidden_states, attention_mask);
-    if (curr.dtype() == torch::kFloat16) {
+    if (curr.dtype() == torch::kFloat16 || curr.dtype() == torch::kBFloat16) {
       curr = clamp_inf_values(curr);
     }
     curr = ff_layer_->forward(curr);
-    if (curr.dtype() == torch::kFloat16) {
+    if (curr.dtype() == torch::kFloat16 || curr.dtype() == torch::kBFloat16) {
       curr = clamp_inf_values(curr);
     }
     return {curr};
@@ -134,12 +134,21 @@ class UMT5BlockImpl : public torch::nn::Module {
 
  private:
   torch::Tensor clamp_inf_values(const torch::Tensor& x) const {
-    const float max_val = 65504.0f;  // fp16 max
-    torch::Tensor clamp_val =
+    float max_val;
+    if (x.scalar_type() == torch::kFloat16) {
+      max_val = 65504.0f;
+    } else if (x.scalar_type() == torch::kFloat32) {
+      max_val = std::numeric_limits<float>::max();
+    } else if (x.scalar_type() == torch::kBFloat16) {
+      max_val = 3.3895313892515355e+38f;
+    } else {
+      max_val = std::numeric_limits<float>::max();
+    }
+    torch::Tensor clamp_value =
         torch::where(torch::isinf(x).any(),
                      torch::tensor(max_val - 1000.0f, x.options()),
                      torch::tensor(max_val, x.options()));
-    return torch::clamp(x, -clamp_val, clamp_val);
+    return torch::clamp(x, -clamp_value, clamp_value);
   }
 
   UMT5LayerSelfAttention self_attention_{nullptr};
@@ -157,9 +166,11 @@ TORCH_MODULE(UMT5Block);
 // ---------------------------------------------------------------------------
 class UMT5EncoderModelImpl final : public torch::nn::Module {
  public:
-  explicit UMT5EncoderModelImpl(const ModelContext& context) {
+  explicit UMT5EncoderModelImpl(const ModelContext& context,
+                                bool is_wan_style = false) {
     auto model_args = context.get_model_args();
     auto options = context.get_tensor_options();
+    is_wan_style_ = is_wan_style;
 
     embed_tokens_ = register_module(
         "embed_tokens",
@@ -184,11 +195,31 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
     embed_tokens_ = new_embeddings;
   }
 
-  torch::Tensor forward(const torch::Tensor& input_ids) {
+  torch::Tensor forward(
+      const torch::Tensor& input_ids,
+      const std::optional<torch::Tensor>& attention_mask = std::nullopt) {
     torch::Tensor hidden_states = embed_tokens_->forward(input_ids);
-    // UMT5: no position_bias passed between blocks — each block recomputes it.
+
+    torch::Tensor causal_mask;
+    if (is_wan_style_) {
+      if (attention_mask.has_value() && attention_mask.value().numel() > 0) {
+        causal_mask = attention_mask.value();
+      } else {
+        auto options =
+            torch::TensorOptions()
+                .dtype(torch::typeMetaToScalarType(input_ids.dtype()))
+                .device(input_ids.device());
+        causal_mask =
+            (1.0 -
+             (input_ids > 0).to(options.dtype()).unsqueeze(1).unsqueeze(2)) *
+            (-1e4);
+      }
+    }
+
     for (size_t i = 0; i < layers_.size(); ++i) {
-      auto layer_outputs = layers_[i]->forward(hidden_states);
+      auto layer_outputs = is_wan_style_
+                               ? layers_[i]->forward(hidden_states, causal_mask)
+                               : layers_[i]->forward(hidden_states);
       hidden_states = layer_outputs[0];
     }
     hidden_states = final_layer_norm_->forward(hidden_states);
@@ -199,8 +230,6 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
     load_from_state_dicts(loader->get_state_dicts(), "");
   }
 
-  // Load from state dicts with an optional key_prefix (e.g. "text_encoder."
-  // when all components share a single flat safetensors file).
   void load_from_state_dicts(
       std::vector<std::unique_ptr<StateDict>>& state_dicts,
       const std::string& key_prefix) {
@@ -208,10 +237,29 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
       StateDict sd = key_prefix.empty()
                          ? state_dict->get_dict_with_prefix("")
                          : state_dict->get_dict_with_prefix(key_prefix);
-      weight::load_weight(sd,
-                          "encoder.embed_tokens.weight",
-                          embed_tokens_->weight,
-                          is_embed_tokens_loaded_);
+      if (is_wan_style_) {
+        weight::load_weight(sd,
+                            "shared.weight",
+                            embed_tokens_->weight,
+                            is_embed_tokens_loaded_);
+        if (!is_embed_tokens_loaded_) {
+          weight::load_weight(sd,
+                              "encoder.embed_tokens.weight",
+                              embed_tokens_->weight,
+                              is_embed_tokens_loaded_);
+        }
+      } else {
+        weight::load_weight(sd,
+                            "encoder.embed_tokens.weight",
+                            embed_tokens_->weight,
+                            is_embed_tokens_loaded_);
+        if (!is_embed_tokens_loaded_) {
+          weight::load_weight(sd,
+                              "shared.weight",
+                              embed_tokens_->weight,
+                              is_embed_tokens_loaded_);
+        }
+      }
       final_layer_norm_->load_state_dict(
           sd.get_dict_with_prefix("encoder.final_layer_norm."));
       for (int64_t i = 0; i < static_cast<int64_t>(layers_.size()); ++i) {
@@ -225,8 +273,7 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
   }
 
   void verify_loaded_weights() const {
-    CHECK(is_embed_tokens_loaded_)
-        << "weight is not loaded for encoder.embed_tokens.weight";
+    CHECK(is_embed_tokens_loaded_) << "weight is not loaded for embed_tokens";
     final_layer_norm_->verify_loaded_weights("encoder.final_layer_norm.");
     for (int64_t i = 0; i < static_cast<int64_t>(layers_.size()); ++i) {
       const std::string block_prefix =
@@ -236,6 +283,7 @@ class UMT5EncoderModelImpl final : public torch::nn::Module {
   }
 
  private:
+  bool is_wan_style_ = false;
   T5LayerNorm final_layer_norm_{nullptr};
   torch::nn::Embedding embed_tokens_{nullptr};
   bool is_embed_tokens_loaded_ = false;

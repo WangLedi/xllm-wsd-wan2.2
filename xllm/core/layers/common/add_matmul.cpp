@@ -124,6 +124,17 @@ AddMatmulWeightTransposedImpl::AddMatmulWeightTransposedImpl(
         register_parameter("weight",
                            torch::empty({out, in}, options.dtype(torch::kInt8)),
                            /*requires_grad=*/false);
+    // Pre-allocate weight_scale and weight_offset for dynamic W8A8 quant.
+    // Shape {out, 1} matches the per-channel dequant scale with a trailing
+    // singleton dimension for broadcasting compatibility.
+    weight_scale_ = register_parameter(
+        "weight_scale",
+        torch::empty({out, 1}, options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
+    weight_offset_ = register_parameter(
+        "weight_offset",
+        torch::empty({out, 1}, options.dtype(torch::kFloat32)),
+        /*requires_grad=*/false);
   }
 }
 
@@ -161,20 +172,22 @@ void AddMatmulWeightTransposedImpl::load_state_dict(
 
   // Lazy quant param registration / fallback to FP16.
   if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-    // Ensure weight_scale and weight_offset are registered.
+    // Ensure weight_scale and weight_offset are registered with correct shape.
+    // Pre-allocation in the constructor already created them, but in some
+    // edge cases (e.g. no quant_args at construction), they may need lazy init.
     if (!weight_scale_.defined()) {
       std::vector<weight::LazyParameterSpec> specs;
       specs.push_back(
           weight::LazyParameterSpec{&weight_scale_,
                                     &weight_scale_is_loaded_,
                                     "weight_scale",
-                                    {weight_.size(0)},
+                                    {weight_.size(0), 1},
                                     options_.dtype(torch::kFloat32)});
       specs.push_back(
           weight::LazyParameterSpec{&weight_offset_,
                                     &weight_offset_is_loaded_,
                                     "weight_offset",
-                                    {weight_.size(0)},
+                                    {weight_.size(0), 1},
                                     options_.dtype(torch::kFloat32)});
       weight::ensure_parameter_storage(this, specs);
     }

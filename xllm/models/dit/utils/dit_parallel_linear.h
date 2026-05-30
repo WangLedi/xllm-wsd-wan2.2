@@ -325,6 +325,20 @@ class DiTParallelLinearImpl : public torch::nn::Module {
             torch::empty({out_per_partition}, tensor_options_),
             /*is_buffer=*/false);
       }
+      // Pre-allocate weight_scale and weight_offset for dynamic W8A8 TP.
+      // When column-parallel, output features are sharded.
+      if (!quant_args_.quant_descs().empty()) {
+        tp_weight_scale_ = register_parameter(
+            "weight_scale",
+            torch::empty({out_per_partition, 1},
+                         tensor_options_.dtype(torch::kFloat32)),
+            /*is_buffer=*/false);
+        tp_weight_offset_ = register_parameter(
+            "weight_offset",
+            torch::empty({out_per_partition, 1},
+                         tensor_options_.dtype(torch::kFloat32)),
+            /*is_buffer=*/false);
+      }
     } else {
       int64_t in_per_partition = in_features_ / tp.tp_size;
       tp_weight_ = register_parameter(
@@ -347,6 +361,20 @@ class DiTParallelLinearImpl : public torch::nn::Module {
             register_parameter("bias",
                                torch::empty({out_features_}, tensor_options_),
                                /*is_buffer=*/false);
+      }
+      // Pre-allocate weight_scale and weight_offset for dynamic W8A8 TP.
+      // When row-parallel, all output features are kept locally.
+      if (!quant_args_.quant_descs().empty()) {
+        tp_weight_scale_ = register_parameter(
+            "weight_scale",
+            torch::empty({out_features_, 1},
+                         tensor_options_.dtype(torch::kFloat32)),
+            /*is_buffer=*/false);
+        tp_weight_offset_ = register_parameter(
+            "weight_offset",
+            torch::empty({out_features_, 1},
+                         tensor_options_.dtype(torch::kFloat32)),
+            /*is_buffer=*/false);
       }
     }
   }
@@ -468,13 +496,13 @@ class DiTParallelLinearImpl : public torch::nn::Module {
             weight::LazyParameterSpec{&tp_weight_scale_,
                                       &tp_weight_scale_is_loaded_,
                                       "weight_scale",
-                                      {weight_scale_size},
+                                      {weight_scale_size, 1},
                                       tensor_options_.dtype(torch::kFloat32)});
         specs.push_back(
             weight::LazyParameterSpec{&tp_weight_offset_,
                                       &tp_weight_offset_is_loaded_,
                                       "weight_offset",
-                                      {weight_scale_size},
+                                      {weight_scale_size, 1},
                                       tensor_options_.dtype(torch::kFloat32)});
         weight::ensure_parameter_storage(this, specs);
       }

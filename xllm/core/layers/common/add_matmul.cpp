@@ -104,37 +104,20 @@ AddMatmulWeightTransposedImpl::AddMatmulWeightTransposedImpl(
     int64_t in,
     int64_t out,
     bool with_bias,
-    const torch::TensorOptions& options)
-    : AddMatmulImpl(in, out, with_bias, options) {}
-
-AddMatmulWeightTransposedImpl::AddMatmulWeightTransposedImpl(
-    int64_t in,
-    int64_t out,
-    bool with_bias,
     const torch::TensorOptions& options,
     const QuantArgs& quant_args)
     : AddMatmulImpl(in, out, with_bias, options),
       quant_args_(quant_args),
       output_dtype_(c10::typeMetaToScalarType(options.dtype())) {
   if (!quant_args_.quant_descs().empty()) {
-    // Pre-register weight as int8. During load_state_dict, if the quant
-    // method is not resolved for this layer, ensure_w8a8_params will
-    // re-register it back to the original dtype.
-    weight_ =
-        register_parameter("weight",
-                           torch::empty({out, in}, options.dtype(torch::kInt8)),
+    weight_scale_ =
+        register_parameter("weight_scale",
+                           torch::empty({out}, options.dtype(torch::kFloat32)),
                            /*requires_grad=*/false);
-    // Pre-allocate weight_scale and weight_offset for dynamic W8A8 quant.
-    // Shape {out, 1} matches the per-channel dequant scale with a trailing
-    // singleton dimension for broadcasting compatibility.
-    weight_scale_ = register_parameter(
-        "weight_scale",
-        torch::empty({out, 1}, options.dtype(torch::kFloat32)),
-        /*requires_grad=*/false);
-    weight_offset_ = register_parameter(
-        "weight_offset",
-        torch::empty({out, 1}, options.dtype(torch::kFloat32)),
-        /*requires_grad=*/false);
+    weight_offset_ =
+        register_parameter("weight_offset",
+                           torch::empty({out}, options.dtype(torch::kFloat32)),
+                           /*requires_grad=*/false);
   }
 }
 
@@ -143,7 +126,8 @@ torch::Tensor AddMatmulWeightTransposedImpl::forward(const torch::Tensor& x) {
     CHECK(weight_scale_is_loaded_ && weight_scale_.defined())
         << "weight_scale is required for w8a8_dynamic quant matmul.";
     auto bias = with_bias_ ? std::optional<torch::Tensor>(bias_) : std::nullopt;
-    auto w_offset = weight_offset_.defined()
+    // Offset only valid when output dtype is INT8.
+    auto w_offset = (weight_offset_.defined() && output_dtype_ == torch::kInt8)
                         ? std::optional<torch::Tensor>(weight_offset_)
                         : std::nullopt;
     return npu_w8a8_dynamic_linear_forward(
@@ -166,46 +150,36 @@ torch::Tensor AddMatmulWeightTransposedImpl::forward(const torch::Tensor& x) {
 
 void AddMatmulWeightTransposedImpl::load_state_dict(
     const StateDict& state_dict) {
-  // Resolve quant method from quant_descs (no-op if quant_args_ is empty).
   resolve_weight_quant_method_for_linear_load(
       quant_args_, state_dict, nullptr, resolved_weight_quant_method_);
 
-  // Lazy quant param registration / fallback to FP16.
   if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-    // Ensure weight_scale and weight_offset are registered with correct shape.
-    // Pre-allocation in the constructor already created them, but in some
-    // edge cases (e.g. no quant_args at construction), they may need lazy init.
-    if (!weight_scale_.defined()) {
-      std::vector<weight::LazyParameterSpec> specs;
-      specs.push_back(
-          weight::LazyParameterSpec{&weight_scale_,
-                                    &weight_scale_is_loaded_,
-                                    "weight_scale",
-                                    {weight_.size(0), 1},
-                                    options_.dtype(torch::kFloat32)});
-      specs.push_back(
-          weight::LazyParameterSpec{&weight_offset_,
-                                    &weight_offset_is_loaded_,
-                                    "weight_offset",
-                                    {weight_.size(0), 1},
-                                    options_.dtype(torch::kFloat32)});
-      weight::ensure_parameter_storage(this, specs);
-    }
-  } else if (!quant_args_.quant_descs().empty()) {
-    // quant_descs is non-empty but this layer wasn't resolved to a quant type.
-    // Re-register weight back to original dtype so checkpoint weights load.
     std::vector<weight::LazyParameterSpec> specs;
     specs.push_back(
         weight::LazyParameterSpec{&weight_,
                                   &weight_is_loaded_,
                                   "weight",
                                   {weight_.size(0), weight_.size(1)},
-                                  options_});
+                                  options_.dtype(torch::kInt8)});
     weight::ensure_parameter_storage(this, specs);
-  }
 
-  if (is_w8a8_dynamic_quant(resolved_weight_quant_method_)) {
-    // Load int8 weight, per-channel scale, and optional offset.
+    if (!weight_scale_.defined()) {
+      std::vector<weight::LazyParameterSpec> scale_specs;
+      scale_specs.push_back(
+          weight::LazyParameterSpec{&weight_scale_,
+                                    &weight_scale_is_loaded_,
+                                    "weight_scale",
+                                    {weight_.size(0)},
+                                    options_.dtype(torch::kFloat32)});
+      scale_specs.push_back(
+          weight::LazyParameterSpec{&weight_offset_,
+                                    &weight_offset_is_loaded_,
+                                    "weight_offset",
+                                    {weight_.size(0)},
+                                    options_.dtype(torch::kFloat32)});
+      weight::ensure_parameter_storage(this, scale_specs);
+    }
+
     if (state_dict.has("weight")) {
       weight::load_weight(state_dict, "weight", weight_, weight_is_loaded_);
     }
@@ -220,7 +194,6 @@ void AddMatmulWeightTransposedImpl::load_state_dict(
                           weight_offset_is_loaded_);
     }
   } else {
-    // Original FP16 load path with optional transpose for addmm.
     if (state_dict.has("weight")) {
       weight::load_weight(state_dict, "weight", weight_, weight_is_loaded_);
       if (with_bias_) {

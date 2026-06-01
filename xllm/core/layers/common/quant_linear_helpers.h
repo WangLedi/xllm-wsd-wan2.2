@@ -245,7 +245,7 @@ inline torch::Tensor npu_w8a8_dynamic_linear_forward(
   quant_matmul_params.x2 = weight;
   quant_matmul_params.transpose2 = true;
   quant_matmul_params.scale = weight_scale;
-  quant_matmul_params.pertoken_scale = pertoken_scale;
+  quant_matmul_params.pertoken_scale = pertoken_scale->reshape({-1});
   quant_matmul_params.output_dtype = output_dtype;
   if (weight_offset.has_value() && weight_offset->defined()) {
     quant_matmul_params.offset = weight_offset;

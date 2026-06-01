@@ -68,13 +68,8 @@ class AddMatmulWeightTransposedImpl : public AddMatmulImpl {
   AddMatmulWeightTransposedImpl(int64_t in,
                                 int64_t out,
                                 bool with_bias,
-                                const torch::TensorOptions& options);
-
-  AddMatmulWeightTransposedImpl(int64_t in,
-                                int64_t out,
-                                bool with_bias,
                                 const torch::TensorOptions& options,
-                                const QuantArgs& quant_args);
+                                const QuantArgs& quant_args = QuantArgs());
 
   torch::Tensor forward(const torch::Tensor& x) override;
 

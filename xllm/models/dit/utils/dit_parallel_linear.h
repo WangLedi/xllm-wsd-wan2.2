@@ -18,6 +18,7 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <optional>
+#include <sstream>
 #include <string>
 
 #include "core/framework/state_dict/utils.h"
@@ -370,10 +371,12 @@ class DiTParallelLinearImpl : public torch::nn::Module {
     params.b = tp_weight_;
     auto output = xllm::kernel::matmul(params);
 
-    auto orig_dtype = output.dtype();
-    auto output_fp32 = output.to(torch::kFloat32);
-    output =
-        parallel_state::reduce(output_fp32, tp.process_group).to(orig_dtype);
+    // auto orig_dtype = output.dtype();
+    // auto output_fp32 = output.to(torch::kFloat32);
+    // output =
+    //     parallel_state::reduce(output_fp32, tp.process_group).to(orig_dtype);
+
+    output = parallel_state::reduce(output, tp.process_group);
 
     if (has_bias_) {
       output = output + tp_bias_;
@@ -411,20 +414,29 @@ class DiTParallelLinearImpl : public torch::nn::Module {
       x = parallel_state::scatter(input, tp.process_group, /*dim=*/-1);
     }
 
-    auto bias =
-        has_bias_ ? std::optional<torch::Tensor>(tp_bias_) : std::nullopt;
+    // Bias must be added AFTER all-reduce for row-parallel, otherwise
+    // each rank adds the full bias and reduce-sum multiplies it by tp_size.
     auto w_offset =
         (tp_weight_offset_.defined() && output_dtype_ == torch::kInt8)
             ? std::optional<torch::Tensor>(tp_weight_offset_)
             : std::nullopt;
-    auto output = layer::npu_w8a8_dynamic_linear_forward(
-        x, tp_weight_, tp_weight_scale_, bias, output_dtype_, w_offset);
+    auto output = layer::npu_w8a8_dynamic_linear_forward(x,
+                                                         tp_weight_,
+                                                         tp_weight_scale_,
+                                                         /*bias=*/std::nullopt,
+                                                         output_dtype_,
+                                                         w_offset);
 
-    auto orig_dtype = output.dtype();
-    auto output_fp32 = output.to(torch::kFloat32);
-    output =
-        parallel_state::reduce(output_fp32, tp.process_group).to(orig_dtype);
+    // auto orig_dtype = output.dtype();
+    // auto output_fp32 = output.to(torch::kFloat32);
+    // output =
+    //     parallel_state::reduce(output_fp32, tp.process_group).to(orig_dtype);
 
+    output = parallel_state::reduce(output, tp.process_group);
+
+    if (has_bias_) {
+      output = output + tp_bias_;
+    }
     return output;
   }
 
@@ -468,6 +480,18 @@ class DiTParallelLinearImpl : public torch::nn::Module {
                                       tensor_options_.dtype(torch::kFloat32)});
         weight::ensure_parameter_storage(this, scale_specs);
       }
+
+      // this->to(kBFloat16) may have converted scale/offset from float32
+      // to BF16. Restore float32 before loading so float32 checkpoint data
+      // is not silently truncated.
+      auto ensure_float32 = [](torch::Tensor& t) {
+        if (t.defined() && t.dtype() != torch::kFloat32) {
+          t.set_data(
+              torch::empty(t.sizes(), t.options().dtype(torch::kFloat32)));
+        }
+      };
+      ensure_float32(tp_weight_scale_);
+      ensure_float32(tp_weight_offset_);
 
       int64_t weight_axis = tp.column_parallel ? 0 : 1;
       weight::load_sharded_weight(state_dict,

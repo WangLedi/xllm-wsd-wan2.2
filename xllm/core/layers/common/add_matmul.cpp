@@ -180,6 +180,17 @@ void AddMatmulWeightTransposedImpl::load_state_dict(
       weight::ensure_parameter_storage(this, scale_specs);
     }
 
+    // this->to(kBFloat16) may have converted scale/offset from float32
+    // to BF16. Restore float32 before loading so float32 checkpoint data
+    // is not silently truncated.
+    auto ensure_float32 = [](torch::Tensor& t) {
+      if (t.defined() && t.dtype() != torch::kFloat32) {
+        t.set_data(torch::empty(t.sizes(), t.options().dtype(torch::kFloat32)));
+      }
+    };
+    ensure_float32(weight_scale_);
+    ensure_float32(weight_offset_);
+
     if (state_dict.has("weight")) {
       weight::load_weight(state_dict, "weight", weight_, weight_is_loaded_);
     }

@@ -230,8 +230,15 @@ inline torch::Tensor npu_w8a8_dynamic_linear_forward(
     const std::optional<torch::Tensor>& bias,
     at::ScalarType output_dtype,
     const std::optional<torch::Tensor>& weight_offset = std::nullopt) {
+  // Flatten 3D input: NPU dynamic_quant kernel degrades on >2D inputs.
+  auto input_sizes = input.sizes();
+  const bool is_3d = input_sizes.size() == 3;
+  const auto x =
+      is_3d ? input.reshape({input_sizes[0] * input_sizes[1], input_sizes[2]})
+            : input;
+
   kernel::NpuQuantizeParams quant_params;
-  quant_params.input = input;
+  quant_params.input = x;
 
   torch::Tensor quantized_input;
   std::optional<torch::Tensor> pertoken_scale;
@@ -253,7 +260,10 @@ inline torch::Tensor npu_w8a8_dynamic_linear_forward(
   if (bias.has_value() && bias->defined()) {
     quant_matmul_params.bias = bias;
   }
-  return kernel::quant_matmul(quant_matmul_params);
+  auto output = kernel::quant_matmul(quant_matmul_params);
+  return is_3d
+             ? output.reshape({input_sizes[0], input_sizes[1], output.size(-1)})
+             : output;
 }
 
 }  // namespace xllm::layer

@@ -478,13 +478,9 @@ class Wan2_2I2VPipelineImpl : public torch::nn::Module {
       float current_guidance;
 
       if (boundary_timestep < 0 || t.item<float>() >= boundary_timestep) {
-        LOG(INFO) << "high-noise t:" << t << "boundary_timestep"
-                  << boundary_timestep;
         current_model = transformer_;
         current_guidance = guidance_scale;
       } else {
-        LOG(INFO) << "low-noise t:" << t << "boundary_timestep"
-                  << boundary_timestep;
         current_model = transformer_2_;
         current_guidance = guidance_scale_2;
       }

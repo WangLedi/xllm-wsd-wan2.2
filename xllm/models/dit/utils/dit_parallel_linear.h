@@ -166,9 +166,10 @@ class DiTParallelLinearImpl : public torch::nn::Module {
       tp_options_->validate();
       init_tp_weights();
     } else {
-      linear_ = register_module("linear",
-                                layer::AddMatmulWeightTransposed(
-                                    in_features, out_features, bias, options));
+      linear_ = register_module(
+          "linear",
+          layer::AddMatmulWeightTransposed(
+              in_features, out_features, bias, options, quant_args_));
     }
   }
 

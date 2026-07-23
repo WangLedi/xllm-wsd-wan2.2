@@ -242,16 +242,12 @@ class WanTimestepEmbeddingImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    linear_1_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("0.", "linear_1.")));
-    linear_2_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("2.", "linear_2.")));
+    linear_1_->load_state_dict(state_dict.get_dict_with_prefix("linear_1."));
+    linear_2_->load_state_dict(state_dict.get_dict_with_prefix("linear_2."));
   }
   void verify_loaded_weights(const std::string& prefix) const {
-    linear_1_->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("0.", "linear_1."));
-    linear_2_->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("2.", "linear_2."));
+    linear_1_->verify_loaded_weights(prefix + "linear_1.");
+    linear_2_->verify_loaded_weights(prefix + "linear_2.");
   }
 
  private:
@@ -362,19 +358,12 @@ class WanGELUImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    if (quant_args_.is_quantized()) {
-      // Quantized checkpoint stores weights directly under the module's
-      // own prefix — no additional sub-prefix wrapping.
-      proj_->as<DiTParallelLinear>()->load_state_dict(state_dict);
-    } else {
-      proj_->as<DiTParallelLinear>()->load_state_dict(
-          state_dict.get_dict_with_prefix("proj."));
-    }
+    proj_->as<DiTParallelLinear>()->load_state_dict(
+        state_dict.get_dict_with_prefix("proj."));
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    proj_->as<DiTParallelLinear>()->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("", "proj."));
+    proj_->as<DiTParallelLinear>()->verify_loaded_weights(prefix + "proj.");
   }
 
  private:
@@ -460,17 +449,13 @@ class WanFeedForwardImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    act_fn_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("0.", "net.0.")));
-    proj_out_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("2.", "net.2.")));
+    act_fn_->load_state_dict(state_dict.get_dict_with_prefix("net.0."));
+    proj_out_->load_state_dict(state_dict.get_dict_with_prefix("net.2."));
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    act_fn_->verify_loaded_weights(prefix +
-                                   quant_args_.resolve_prefix("0.", "net.0."));
-    proj_out_->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("2.", "net.2."));
+    act_fn_->verify_loaded_weights(prefix + "net.0.");
+    proj_out_->verify_loaded_weights(prefix + "net.2.");
   }
 
  private:
@@ -532,17 +517,13 @@ class WanPixArtAlphaTextProjectionImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    linear_1_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("0.", "linear_1.")));
-    linear_2_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("2.", "linear_2.")));
+    linear_1_->load_state_dict(state_dict.get_dict_with_prefix("linear_1."));
+    linear_2_->load_state_dict(state_dict.get_dict_with_prefix("linear_2."));
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    linear_1_->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("0.", "linear_1."));
-    linear_2_->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("2.", "linear_2."));
+    linear_1_->verify_loaded_weights(prefix + "linear_1.");
+    linear_2_->verify_loaded_weights(prefix + "linear_2.");
   }
 
  private:
@@ -903,14 +884,10 @@ class WanAttentionImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    to_q_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("q.", "to_q.")));
-    to_k_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("k.", "to_k.")));
-    to_v_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("v.", "to_v.")));
-    to_out_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("o.", "to_out.0.")));
+    to_q_->load_state_dict(state_dict.get_dict_with_prefix("to_q."));
+    to_k_->load_state_dict(state_dict.get_dict_with_prefix("to_k."));
+    to_v_->load_state_dict(state_dict.get_dict_with_prefix("to_v."));
+    to_out_->load_state_dict(state_dict.get_dict_with_prefix("to_out.0."));
 
     norm_q_->load_state_dict(state_dict.get_dict_with_prefix("norm_q."));
     norm_k_->load_state_dict(state_dict.get_dict_with_prefix("norm_k."));
@@ -926,14 +903,10 @@ class WanAttentionImpl : public torch::nn::Module {
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    to_q_->verify_loaded_weights(prefix +
-                                 quant_args_.resolve_prefix("q.", "to_q."));
-    to_k_->verify_loaded_weights(prefix +
-                                 quant_args_.resolve_prefix("k.", "to_k."));
-    to_v_->verify_loaded_weights(prefix +
-                                 quant_args_.resolve_prefix("v.", "to_v."));
-    to_out_->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("o.", "to_out.0."));
+    to_q_->verify_loaded_weights(prefix + "to_q.");
+    to_k_->verify_loaded_weights(prefix + "to_k.");
+    to_v_->verify_loaded_weights(prefix + "to_v.");
+    to_out_->verify_loaded_weights(prefix + "to_out.0.");
     if (add_k_proj_) {
       add_k_proj_->verify_loaded_weights(prefix + "add_k_proj.");
       add_v_proj_->verify_loaded_weights(prefix + "add_v_proj.");
@@ -1119,12 +1092,11 @@ class WanTimeTextImageEmbeddingImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    time_embedder_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("time_embedding.", "time_embedder.")));
-    time_proj_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("time_projection.1.", "time_proj.")));
-    text_embedder_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("text_embedding.", "text_embedder.")));
+    time_embedder_->load_state_dict(
+        state_dict.get_dict_with_prefix("time_embedder."));
+    time_proj_->load_state_dict(state_dict.get_dict_with_prefix("time_proj."));
+    text_embedder_->load_state_dict(
+        state_dict.get_dict_with_prefix("text_embedder."));
     if (image_embedder_) {
       image_embedder_->load_state_dict(
           state_dict.get_dict_with_prefix("image_embedder."));
@@ -1132,15 +1104,9 @@ class WanTimeTextImageEmbeddingImpl : public torch::nn::Module {
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    time_embedder_->verify_loaded_weights(
-        prefix +
-        quant_args_.resolve_prefix("time_embedding.", "time_embedder."));
-    time_proj_->verify_loaded_weights(
-        prefix +
-        quant_args_.resolve_prefix("time_projection.1.", "time_proj."));
-    text_embedder_->verify_loaded_weights(
-        prefix +
-        quant_args_.resolve_prefix("text_embedding.", "text_embedder."));
+    time_embedder_->verify_loaded_weights(prefix + "time_embedder.");
+    time_proj_->verify_loaded_weights(prefix + "time_proj.");
+    text_embedder_->verify_loaded_weights(prefix + "text_embedder.");
     if (image_embedder_) {
       image_embedder_->verify_loaded_weights(prefix + "image_embedder.");
     }
@@ -1431,36 +1397,26 @@ class WanTransformerBlockImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    attn1_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("self_attn.", "attn1.")));
-    attn2_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("cross_attn.", "attn2.")));
+    attn1_->load_state_dict(state_dict.get_dict_with_prefix("attn1."));
+    attn2_->load_state_dict(state_dict.get_dict_with_prefix("attn2."));
     if (cross_attn_norm_ && norm2_) {
-      norm2_->load_state_dict(state_dict.get_dict_with_prefix(
-          quant_args_.resolve_prefix("norm3.", "norm2.")));
+      norm2_->load_state_dict(state_dict.get_dict_with_prefix("norm2."));
     }
-    ff_->load_state_dict(state_dict.get_dict_with_prefix(
-        quant_args_.resolve_prefix("ffn.", "ffn.")));
-    weight::load_weight(
-        state_dict,
-        quant_args_.resolve_prefix("modulation", "scale_shift_table"),
-        scale_shift_table_,
-        scale_shift_table_loaded_);
+    ff_->load_state_dict(state_dict.get_dict_with_prefix("ffn."));
+    weight::load_weight(state_dict,
+                        "scale_shift_table",
+                        scale_shift_table_,
+                        scale_shift_table_loaded_);
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    attn1_->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("self_attn.", "attn1."));
+    attn1_->verify_loaded_weights(prefix + "attn1.");
     if (cross_attn_norm_) {
-      norm2_->verify_loaded_weights(
-          prefix + quant_args_.resolve_prefix("norm3.", "norm2."));
+      norm2_->verify_loaded_weights(prefix + "norm2.");
     }
-    attn2_->verify_loaded_weights(
-        prefix + quant_args_.resolve_prefix("cross_attn.", "attn2."));
-    ff_->verify_loaded_weights(prefix +
-                               quant_args_.resolve_prefix("ffn.", "ffn."));
-    auto scale_key =
-        quant_args_.resolve_prefix("modulation", "scale_shift_table");
+    attn2_->verify_loaded_weights(prefix + "attn2.");
+    ff_->verify_loaded_weights(prefix + "ffn.");
+    auto scale_key = "scale_shift_table";
     CHECK(scale_shift_table_loaded_)
         << scale_key << " is not loaded for " << prefix + scale_key;
   }
@@ -1732,25 +1688,17 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                         patch_embedding_->bias,
                         pad_embedding_bias_loaded_);
 
-    if (quant_args_.is_quantized()) {
-      // Quantized checkpoint stores condition_embedder weights directly
-      // under the top-level prefix — no "condition_embedder." wrapper.
-      condition_embedder_->load_state_dict(state_dict);
-      proj_out_->load_state_dict(state_dict.get_dict_with_prefix("head.head."));
-    } else {
-      condition_embedder_->load_state_dict(
-          state_dict.get_dict_with_prefix("condition_embedder."));
-      proj_out_->load_state_dict(state_dict.get_dict_with_prefix("proj_out."));
-    }
+    condition_embedder_->load_state_dict(
+        state_dict.get_dict_with_prefix("condition_embedder."));
+    proj_out_->load_state_dict(state_dict.get_dict_with_prefix("proj_out."));
     for (int64_t i = 0; i < transformer_layers_.size(); ++i) {
       transformer_layers_[i]->load_state_dict(
           state_dict.get_dict_with_prefix("blocks." + std::to_string(i) + "."));
     }
-    weight::load_weight(
-        state_dict,
-        quant_args_.resolve_prefix("head.modulation", "scale_shift_table"),
-        scale_shift_table_,
-        scale_shift_table_loaded_);
+    weight::load_weight(state_dict,
+                        "scale_shift_table",
+                        scale_shift_table_,
+                        scale_shift_table_loaded_);
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
@@ -1759,20 +1707,13 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
     CHECK(pad_embedding_bias_loaded_) << "patch_embedding is not loaded for"
                                       << prefix << "pad_embedding.bias";
 
-    if (quant_args_.is_quantized()) {
-      condition_embedder_->verify_loaded_weights(prefix);
-      proj_out_->verify_loaded_weights(prefix + "head.head.");
-    } else {
-      condition_embedder_->verify_loaded_weights(prefix +
-                                                 "condition_embedder.");
-      proj_out_->verify_loaded_weights(prefix + "proj_out.");
-    }
+    condition_embedder_->verify_loaded_weights(prefix + "condition_embedder.");
+    proj_out_->verify_loaded_weights(prefix + "proj_out.");
     for (size_t i = 0; i < transformer_layers_.size(); ++i) {
       transformer_layers_[i]->verify_loaded_weights(prefix + "blocks." +
                                                     std::to_string(i) + ".");
     }
-    auto scale_key =
-        quant_args_.resolve_prefix("head.modulation", "scale_shift_table");
+    auto scale_key = "scale_shift_table";
     CHECK(scale_shift_table_loaded_)
         << scale_key << " is not loaded for " << prefix + scale_key;
   }

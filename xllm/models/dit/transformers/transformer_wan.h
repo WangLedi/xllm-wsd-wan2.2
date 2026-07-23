@@ -36,13 +36,11 @@ limitations under the License.
 #include "core/framework/state_dict/utils.h"
 #include "core/layers/common/ada_layer_norm.h"
 #include "core/layers/common/add_matmul.h"
+#include "core/layers/common/linear.h"
 #include "core/layers/common/rms_norm.h"
 #include "models/dit/utils/dit_parallel_linear.h"
 #include "models/dit/utils/sparse_attention.h"
 
-using xllm::dit::DiTParallelLinear;
-using xllm::dit::SpOptions;
-using xllm::dit::TpOptions;
 #if defined(USE_NPU)
 #include "core/layers/npu/loader/rolling_load_manager.h"
 #include "core/layers/npu/loader/rolling_weight_buffer.h"
@@ -140,6 +138,23 @@ inline torch::Tensor sp_slice_heads(const torch::Tensor& input,
       .view({input.size(0), -1, n_heads * sp_group->world_size(), dim_head})
       .slice(2, sp_group->rank() * n_heads, (sp_group->rank() + 1) * n_heads)
       .flatten(2, 3);
+}
+
+inline torch::Tensor sp_all_to_all_reverse(const torch::Tensor& input,
+                                           int64_t heads,
+                                           int64_t dim_head,
+                                           int64_t tp_size,
+                                           ProcessGroup* sp_group) {
+  auto fn = parallel_state::all_to_all_4D(
+      input.view({input.size(0),
+                  -1,
+                  heads / (tp_size * sp_group->world_size()),
+                  dim_head}),
+      /*scatter_dim=*/1,
+      /*gather_dim=*/2,
+      /*async=*/false,
+      sp_group);
+  return fn().view({input.size(0), -1, heads * dim_head / tp_size});
 }
 
 class FP32LayerNormImpl : public torch::nn::Module {
@@ -332,19 +347,15 @@ class WanGELUImpl : public torch::nn::Module {
         options_(context.get_tensor_options()),
         parallel_args_(parallel_args) {
     quant_args_ = context.get_quant_args();
-    std::optional<TpOptions> tp = std::nullopt;
-    if (::xllm::ParallelConfig::get_instance().tp_size() > 1) {
-      tp = TpOptions::col(parallel_args_.dit_tp_group_,
-                          /*gather_output=*/false);
-    }
-    auto proj = DiTParallelLinear(dim_in,
-                                  dim_out,
-                                  with_bias,
-                                  options_,
-                                  /*sp=*/std::nullopt,
-                                  tp,
-                                  quant_args_);
-    proj_ = register_module("proj", proj);
+    auto* tp_group = parallel_args_.dit_tp_group_;
+    proj_ = register_module("proj",
+                            layer::ColumnParallelLinear(dim_in,
+                                                        dim_out,
+                                                        with_bias,
+                                                        /*gather_output=*/false,
+                                                        quant_args_,
+                                                        tp_group,
+                                                        options_));
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states_in) {
@@ -358,12 +369,11 @@ class WanGELUImpl : public torch::nn::Module {
   }
 
   void load_state_dict(const StateDict& state_dict) {
-    proj_->as<DiTParallelLinear>()->load_state_dict(
-        state_dict.get_dict_with_prefix("proj."));
+    proj_->load_state_dict(state_dict.get_dict_with_prefix("proj."));
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    proj_->as<DiTParallelLinear>()->verify_loaded_weights(prefix + "proj.");
+    CHECK(proj_->is_weight_loaded()) << prefix << "proj weight not loaded";
   }
 
  private:
@@ -371,7 +381,7 @@ class WanGELUImpl : public torch::nn::Module {
   bool approximate_;
   torch::TensorOptions options_;
   ParallelArgs parallel_args_;
-  DiTParallelLinear proj_{nullptr};
+  layer::ColumnParallelLinear proj_{nullptr};
 };
 TORCH_MODULE(WanGELU);
 
@@ -421,16 +431,17 @@ class WanFeedForwardImpl : public torch::nn::Module {
 
     dropout_ = register_module("dropout", torch::nn::Dropout(dropout));
 
-    auto tp_out = TpOptions::row(parallel_args_.dit_tp_group_,
-                                 /*gather_output=*/true);
-    auto proj_out = DiTParallelLinear(actual_inner_dim,
-                                      actual_dim_out,
-                                      with_bias,
-                                      options_,
-                                      /*sp=*/std::nullopt,
-                                      tp_out,
-                                      quant_args_);
-    proj_out_ = register_module("proj_out", proj_out);
+    auto* tp_group = parallel_args_.dit_tp_group_;
+    proj_out_ = register_module(
+        "proj_out",
+        layer::RowParallelLinear(actual_inner_dim,
+                                 actual_dim_out,
+                                 with_bias,
+                                 /*input_is_parallelized=*/true,
+                                 /*enable_result_reduction=*/true,
+                                 quant_args_,
+                                 tp_group,
+                                 options_));
 
     if (final_dropout) {
       final_dropout_ =
@@ -455,7 +466,7 @@ class WanFeedForwardImpl : public torch::nn::Module {
 
   void verify_loaded_weights(const std::string& prefix) const {
     act_fn_->verify_loaded_weights(prefix + "net.0.");
-    proj_out_->verify_loaded_weights(prefix + "net.2.");
+    CHECK(proj_out_->is_weight_loaded()) << prefix << "net.2 weight not loaded";
   }
 
  private:
@@ -464,7 +475,7 @@ class WanFeedForwardImpl : public torch::nn::Module {
   ParallelArgs parallel_args_;
   WanGELU act_fn_{nullptr};
   torch::nn::Dropout dropout_{nullptr};
-  DiTParallelLinear proj_out_{nullptr};
+  layer::RowParallelLinear proj_out_{nullptr};
   torch::nn::Dropout final_dropout_{nullptr};
 };
 TORCH_MODULE(WanFeedForward);
@@ -547,6 +558,7 @@ class WanAttentionImpl : public torch::nn::Module {
         sparse_attn_config_(sparse_attn_config) {
     auto model_args = context.get_model_args();
     quant_args_ = context.get_quant_args();
+    auto* tp_group = parallel_args_.dit_tp_group_;
     dim_ = model_args.head_dim() * model_args.n_heads();
     heads_ = model_args.n_heads();
     dim_head_ = model_args.head_dim();
@@ -564,87 +576,68 @@ class WanAttentionImpl : public torch::nn::Module {
     } else {
       kv_inner_dim_ = heads_ * dim_head_;
     }
-    // Pre-build options that get reused
-    auto tp_qk = TpOptions::col(parallel_args_.dit_tp_group_,
-                                /*gather_output=*/false);
-    auto tp_v = TpOptions::col(parallel_args_.dit_tp_group_,
-                               /*gather_output=*/false);
-    auto tp_out = TpOptions::row(parallel_args_.dit_tp_group_,
-                                 /*gather_output=*/true);
-
-    auto sp_before = SpOptions(heads_,
-                               dim_head_,
-                               dim_,
-                               /*before_attention=*/true,
-                               parallel_args_.dit_sp_group_);
-    auto sp_after = SpOptions(heads_,
-                              dim_head_,
-                              dim_,
-                              /*before_attention=*/false,
-                              parallel_args_.dit_sp_group_);
-
-    // Q/K: TP only (SP handled in forward() due to norm ordering)
+    // Q/K: TP column only (SP handled in forward() due to norm ordering)
     to_q_ = register_module("to_q",
-                            DiTParallelLinear(dim_,
-                                              heads_ * dim_head_,
-                                              true,
-                                              options_,
-                                              /*sp=*/std::nullopt,
-                                              tp_qk,
-                                              quant_args_));
+                            layer::ColumnParallelLinear(dim_,
+                                                        heads_ * dim_head_,
+                                                        true,
+                                                        /*gather_output=*/false,
+                                                        quant_args_,
+                                                        tp_group,
+                                                        options_));
     to_k_ = register_module("to_k",
-                            DiTParallelLinear(dim_,
-                                              kv_inner_dim_,
-                                              true,
-                                              options_,
-                                              /*sp=*/std::nullopt,
-                                              tp_qk,
-                                              quant_args_));
+                            layer::ColumnParallelLinear(dim_,
+                                                        kv_inner_dim_,
+                                                        true,
+                                                        /*gather_output=*/false,
+                                                        quant_args_,
+                                                        tp_group,
+                                                        options_));
 
-    // V: TP+SP for self-attention, TP only for cross-attention
-    bool is_self_attn = cross_attention_dim_head <= 0;
-    to_v_ = register_module(
-        "to_v",
-        DiTParallelLinear(dim_,
-                          kv_inner_dim_,
-                          true,
-                          options_,
-                          is_self_attn ? sp_before : std::optional<SpOptions>{},
-                          tp_v,
-                          quant_args_));
+    // V: TP column only (SP all2all handled in forward())
+    to_v_ = register_module("to_v",
+                            layer::ColumnParallelLinear(dim_,
+                                                        kv_inner_dim_,
+                                                        true,
+                                                        /*gather_output=*/false,
+                                                        quant_args_,
+                                                        tp_group,
+                                                        options_));
 
-    // to_out: TP+SP row parallel
-    to_out_ = register_module("to_out",
-                              DiTParallelLinear(heads_ * dim_head_,
-                                                dim_,
-                                                true,
-                                                options_,
-                                                sp_after,
-                                                tp_out,
-                                                quant_args_));
+    // to_out: TP row only (SP all2all handled in forward())
+    to_out_ = register_module(
+        "to_out",
+        layer::RowParallelLinear(heads_ * dim_head_,
+                                 dim_,
+                                 true,
+                                 /*input_is_parallelized=*/true,
+                                 /*enable_result_reduction=*/true,
+                                 quant_args_,
+                                 tp_group,
+                                 options_));
     norm_q_ = register_module(
         "norm_q", layer::RMSNorm(dim_head_ * heads_, eps_, options_));
     norm_k_ = register_module(
         "norm_k", layer::RMSNorm(dim_head_ * heads_, eps_, options_));
     if (added_kv_proj_dim_ > 0) {
-      auto add_k_tp = TpOptions::col(parallel_args_.dit_tp_group_,
-                                     /*gather_output=*/false);
-      auto add_v_tp = TpOptions::col(parallel_args_.dit_tp_group_,
-                                     /*gather_output=*/false);
-      auto add_k_proj = DiTParallelLinear(added_kv_proj_dim_,
-                                          heads_ * dim_head_,
-                                          true,
-                                          options_,
-                                          /*sp=*/std::nullopt,
-                                          add_k_tp);
-      add_k_proj_ = register_module("add_k_proj", add_k_proj);
-      auto add_v_proj = DiTParallelLinear(added_kv_proj_dim_,
-                                          heads_ * dim_head_,
-                                          true,
-                                          options_,
-                                          /*sp=*/std::nullopt,
-                                          add_v_tp);
-      add_v_proj_ = register_module("add_v_proj", add_v_proj);
+      add_k_proj_ =
+          register_module("add_k_proj",
+                          layer::ColumnParallelLinear(added_kv_proj_dim_,
+                                                      heads_ * dim_head_,
+                                                      true,
+                                                      /*gather_output=*/false,
+                                                      QuantArgs(),
+                                                      tp_group,
+                                                      options_));
+      add_v_proj_ =
+          register_module("add_v_proj",
+                          layer::ColumnParallelLinear(added_kv_proj_dim_,
+                                                      heads_ * dim_head_,
+                                                      true,
+                                                      /*gather_output=*/false,
+                                                      QuantArgs(),
+                                                      tp_group,
+                                                      options_));
       norm_added_k_ = register_module(
           "norm_added_k", layer::RMSNorm(dim_head_ * heads_, eps_, options_));
     }
@@ -798,7 +791,7 @@ class WanAttentionImpl : public torch::nn::Module {
       key = std::get<0>(norm_k_->forward(key));
     }
 
-    // ── Step 3: SP all2all for Q/K (V already done in layer) ──
+    // ── Step 3: SP all2all for Q/K/V (self-attn) or slice K/V (cross-attn) ──
     int64_t batch_size = query.size(0);
     int64_t n_heads = heads_;
     if (::xllm::ParallelConfig::get_instance().tp_size() > 1) {
@@ -816,6 +809,11 @@ class WanAttentionImpl : public torch::nn::Module {
                             dim_head_,
                             ::xllm::ParallelConfig::get_instance().tp_size(),
                             parallel_args_.dit_sp_group_);
+        value = sp_all_to_all(value,
+                              heads_,
+                              dim_head_,
+                              ::xllm::ParallelConfig::get_instance().tp_size(),
+                              parallel_args_.dit_sp_group_);
       } else {
         key = sp_slice_heads(key,
                              heads_,
@@ -878,6 +876,14 @@ class WanAttentionImpl : public torch::nn::Module {
     if (hidden_states_img.defined()) {
       hidden_states = hidden_states + hidden_states_img;
     }
+    if (::xllm::ParallelConfig::get_instance().sp_size() > 1) {
+      hidden_states = sp_all_to_all_reverse(
+          hidden_states,
+          heads_,
+          dim_head_,
+          ::xllm::ParallelConfig::get_instance().tp_size(),
+          parallel_args_.dit_sp_group_);
+    }
     hidden_states = to_out_->forward(hidden_states);
 
     return hidden_states;
@@ -903,13 +909,16 @@ class WanAttentionImpl : public torch::nn::Module {
   }
 
   void verify_loaded_weights(const std::string& prefix) const {
-    to_q_->verify_loaded_weights(prefix + "to_q.");
-    to_k_->verify_loaded_weights(prefix + "to_k.");
-    to_v_->verify_loaded_weights(prefix + "to_v.");
-    to_out_->verify_loaded_weights(prefix + "to_out.0.");
+    CHECK(to_q_->is_weight_loaded()) << prefix << "to_q weight not loaded";
+    CHECK(to_k_->is_weight_loaded()) << prefix << "to_k weight not loaded";
+    CHECK(to_v_->is_weight_loaded()) << prefix << "to_v weight not loaded";
+    CHECK(to_out_->is_weight_loaded())
+        << prefix << "to_out.0 weight not loaded";
     if (add_k_proj_) {
-      add_k_proj_->verify_loaded_weights(prefix + "add_k_proj.");
-      add_v_proj_->verify_loaded_weights(prefix + "add_v_proj.");
+      CHECK(add_k_proj_->is_weight_loaded())
+          << prefix << "add_k_proj weight not loaded";
+      CHECK(add_v_proj_->is_weight_loaded())
+          << prefix << "add_v_proj weight not loaded";
     }
   }
 
@@ -924,12 +933,12 @@ class WanAttentionImpl : public torch::nn::Module {
   float dropout_;
   bool is_cross_attention_;
 
-  DiTParallelLinear to_q_{nullptr};
-  DiTParallelLinear to_k_{nullptr};
-  DiTParallelLinear to_v_{nullptr};
-  DiTParallelLinear to_out_{nullptr};
-  DiTParallelLinear add_k_proj_{nullptr};
-  DiTParallelLinear add_v_proj_{nullptr};
+  layer::ColumnParallelLinear to_q_{nullptr};
+  layer::ColumnParallelLinear to_k_{nullptr};
+  layer::ColumnParallelLinear to_v_{nullptr};
+  layer::RowParallelLinear to_out_{nullptr};
+  layer::ColumnParallelLinear add_k_proj_{nullptr};
+  layer::ColumnParallelLinear add_v_proj_{nullptr};
   ParallelArgs parallel_args_;
 
   layer::RMSNorm norm_q_{nullptr};

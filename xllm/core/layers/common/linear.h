@@ -282,6 +282,14 @@ class RowParallelLinearImpl : public torch::nn::Module {
   }
   ProcessGroup* process_group() const { return process_group_; }
 
+  bool is_weight_loaded() const {
+    if (quant_args_.quant_method() == kQuantMethodSmoothquant) {
+      return qweight_is_loaded_ && per_channel_scale_is_loaded_ &&
+             smooth_is_loaded_;
+    }
+    return weight_is_loaded_;
+  }
+
  private:
   // parameter members, must be registered
   // we allocate the transpose since linear performs XA^T.

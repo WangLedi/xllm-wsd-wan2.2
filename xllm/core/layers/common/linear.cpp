@@ -675,11 +675,27 @@ torch::Tensor ColumnParallelLinearImpl::forward(torch::Tensor input) {
         input, weight_, weight_scale.value(), bias, output_dtype_);
 #endif
   } else {
-    xllm::kernel::MatmulParams matmul_params;
-    matmul_params.a = input;
-    matmul_params.b = weight_;
-    matmul_params.bias = bias;
-    output = xllm::kernel::matmul(matmul_params);
+    if (weight_world_size_ == 1) {
+      // Weight [in,out] after load transpose — same layout as main branch
+      if (bias_.defined()) {
+        auto sizes = input.sizes();
+        if (sizes.size() == 3) {
+          auto t = input.reshape({sizes[0] * sizes[1], sizes[2]});
+          output = torch::addmm(bias_, t, weight_)
+                       .reshape({sizes[0], sizes[1], weight_.size(1)});
+        } else {
+          output = torch::addmm(bias_, input, weight_);
+        }
+      } else {
+        output = torch::matmul(input, weight_);
+      }
+    } else {
+      xllm::kernel::MatmulParams matmul_params;
+      matmul_params.a = input;
+      matmul_params.b = weight_;
+      matmul_params.bias = bias;
+      output = xllm::kernel::matmul(matmul_params);
+    }
   }
 
   if (world_size_ > 1 && gather_output_) {
@@ -771,6 +787,11 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
   } else {
     LOAD_SHARDED_WEIGHT(weight, 0);
+    // Transpose weight from [out,in] to [in,out] matching main branch layout
+    if (weight_world_size_ == 1 && weight_is_loaded_) {
+      auto transposed = weight_.data().transpose(0, 1).contiguous();
+      weight_.set_data(transposed);
+    }
   }
 
   if (bias_.defined()) {
@@ -1539,92 +1560,26 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
     if (!input_is_parallelized_ && !skip_scatter) {
       input = xllm::parallel_state::scatter(input, process_group_);
     }
-#if defined(USE_NPU)
-    if (wants_mmrs(reduce_mode) && fc1_ctx && is_sequence_sharded(*fc1_ctx) &&
-        fc1_ctx->enable_mmrs_fusion) {
-      bool can_try_mmrs = input.defined() && weight_.defined() &&
-                          input.dim() == 2 &&
-                          input.size(0) == fc1_ctx->original_num_tokens &&
-                          (!bias.has_value() || fc1_ctx->pad_size == 0);
-      if (can_try_mmrs) {
-        torch::Tensor mmrs_input = input;
-        if (fc1_ctx->pad_size > 0) {
-          mmrs_input = pad_rows_by_copy(input, fc1_ctx->padded_num_tokens);
-        }
-
-        auto output_shape = mmrs_input.sizes().vec();
-        output_shape[0] = fc1_ctx->padded_local_num_tokens;
-        output_shape[1] = weight_.size(0);
-
-        xllm::kernel::MatmulReduceScatterParams mmrs_params;
-        mmrs_params.a = mmrs_input;
-        mmrs_params.b = mmrs_weight_transposed();
-        mmrs_params.bias = bias;
-        mmrs_params.process_group = process_group_;
-        mmrs_params.comm_mode = fc1_ctx->mmrs_comm_mode;
-        try {
-          output = xllm::kernel::matmul_reduce_scatter(mmrs_params);
-        } catch (const c10::Error& error) {
-          LOG_FIRST_N(WARNING, 8)
-              << "FC1 MMRS call failed; fallback reduction will run: "
-              << error.what_without_backtrace();
-          output = torch::Tensor();
-        }
-        if (output.defined() &&
-            output.sizes() == torch::IntArrayRef(output_shape)) {
-          return output;
-        }
-        if (output.defined()) {
-          LOG_FIRST_N(WARNING, 8)
-              << "FC1 MMRS returned non-local shape; fallback reduction will "
-                 "run. input="
-              << input.sizes() << ", weight=" << weight_.sizes()
-              << ", returned_output=" << output.sizes()
-              << ", expected_local_output=" << output_shape;
-          output = torch::Tensor();
+    if (world_size_ == 1) {
+      // Weight [in,out] after load transpose — same layout as main branch
+      if (bias_.defined()) {
+        auto sizes = input.sizes();
+        if (sizes.size() == 3) {
+          auto t = input.reshape({sizes[0] * sizes[1], sizes[2]});
+          output = torch::addmm(bias_, t, weight_)
+                       .reshape({sizes[0], sizes[1], weight_.size(1)});
+        } else {
+          output = torch::addmm(bias_, input, weight_);
         }
       } else {
-        LOG_FIRST_N(WARNING, 8)
-            << "FC1 MMRS skipped for unsupported row-parallel shape; fallback "
-               "to matmul + reduce_scatter. input="
-            << input.sizes() << ", weight=" << weight_.sizes()
-            << ", original_num_tokens=" << fc1_ctx->original_num_tokens
-            << ", pad_size=" << fc1_ctx->pad_size
-            << ", has_bias=" << bias.has_value()
-            << ", input_dim=" << input.dim();
-      }
-
-      if (!output.defined()) {
-        xllm::kernel::MatmulParams matmul_params;
-        matmul_params.a = input;
-        matmul_params.b = weight_;
-        matmul_params.bias = bias;
-        output = xllm::kernel::matmul(matmul_params);
+        output = torch::matmul(input, weight_);
       }
     } else {
-      if (wants_mmrs(reduce_mode)) {
-        LOG_FIRST_N(WARNING, 16)
-            << "FC1 MMRS skipped before row-parallel matmul: fc1_ctx="
-            << (fc1_ctx != nullptr) << ", sequence_sharded="
-            << (fc1_ctx != nullptr && is_sequence_sharded(*fc1_ctx))
-            << ", enable_mmrs_fusion="
-            << (fc1_ctx != nullptr && fc1_ctx->enable_mmrs_fusion)
-            << ", reduce_mode=" << static_cast<int>(reduce_mode)
-            << ", input=" << input.sizes();
-      }
       xllm::kernel::MatmulParams matmul_params;
       matmul_params.a = input;
       matmul_params.b = weight_;
-      matmul_params.bias = bias;
       output = xllm::kernel::matmul(matmul_params);
     }
-#else
-    xllm::kernel::MatmulParams matmul_params;
-    matmul_params.a = input;
-    matmul_params.b = weight_;
-    matmul_params.bias = bias;
-    output = xllm::kernel::matmul(matmul_params);
-#endif
   }
 
   if (reduce_mode == RowParallelReduceMode::NONE) {
@@ -1641,6 +1596,10 @@ torch::Tensor RowParallelLinearImpl::forward_impl(
 
   if (enable_result_reduction_ && world_size_ > 1) {
     output = xllm::parallel_state::reduce(output, process_group_);
+  }
+  // Add bias AFTER reduce for row-parallel (matching main branch)
+  if (bias_.defined() && world_size_ > 1) {
+    output = output + bias_;
   }
   return output;
 }
@@ -1710,6 +1669,11 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
   } else {
     LOAD_SHARDED_WEIGHT(weight, 1);
+    // Transpose weight from [out,in] to [in,out] matching main branch layout
+    if (world_size_ == 1 && weight_is_loaded_) {
+      auto transposed = weight_.data().transpose(0, 1).contiguous();
+      weight_.set_data(transposed);
+    }
   }
 
   if (bias_.defined()) {

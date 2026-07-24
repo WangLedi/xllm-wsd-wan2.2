@@ -1736,7 +1736,25 @@ class WanTransformer3DModelImpl : public torch::nn::Module {
                   bool rolling = false) {
     auto freqs_cos_fp32 = rope_->get_freqs_cos().clone();
     auto freqs_sin_fp32 = rope_->get_freqs_sin().clone();
+
+    // Save INT8 weights: to(bf16) would corrupt them, restore after
+    std::vector<std::pair<std::string, torch::Tensor>> int8_backup;
+    for (auto& p : this->named_parameters()) {
+      if (p.value().scalar_type() == torch::kInt8) {
+        int8_backup.emplace_back(p.key(), p.value().cpu().clone());
+      }
+    }
+
     this->to(rolling ? torch::kCPU : options_.device(), torch::kBFloat16);
+
+    for (auto& p : this->named_parameters()) {
+      for (auto& [name, saved] : int8_backup) {
+        if (p.key() == name) {
+          p.value().set_data(saved.to(options_.device()).to(torch::kInt8));
+        }
+      }
+    }
+
     for (const auto& state_dict : loader->get_state_dicts()) {
       load_state_dict(*state_dict);
     }

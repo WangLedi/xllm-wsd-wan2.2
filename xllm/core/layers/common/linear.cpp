@@ -654,11 +654,27 @@ torch::Tensor ColumnParallelLinearImpl::forward(torch::Tensor input) {
         input, weight_, weight_scale.value(), bias, output_dtype_);
 #endif
   } else {
-    xllm::kernel::MatmulParams matmul_params;
-    matmul_params.a = input;
-    matmul_params.b = weight_;
-    matmul_params.bias = bias;
-    output = xllm::kernel::matmul(matmul_params);
+    if (weight_world_size_ == 1) {
+      // Weight [in,out] after load transpose — same layout as main branch
+      if (bias_.defined()) {
+        auto sizes = input.sizes();
+        if (sizes.size() == 3) {
+          auto t = input.reshape({sizes[0] * sizes[1], sizes[2]});
+          output = torch::addmm(bias_, t, weight_)
+                       .reshape({sizes[0], sizes[1], weight_.size(1)});
+        } else {
+          output = torch::addmm(bias_, input, weight_);
+        }
+      } else {
+        output = torch::matmul(input, weight_);
+      }
+    } else {
+      xllm::kernel::MatmulParams matmul_params;
+      matmul_params.a = input;
+      matmul_params.b = weight_;
+      matmul_params.bias = bias;
+      output = xllm::kernel::matmul(matmul_params);
+    }
   }
 
   if (world_size_ > 1 && gather_output_) {
@@ -750,6 +766,11 @@ void ColumnParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
   } else {
     LOAD_SHARDED_WEIGHT(weight, 0);
+    // Transpose weight from [out,in] to [in,out] matching main branch layout
+    if (weight_world_size_ == 1 && weight_is_loaded_) {
+      auto transposed = weight_.data().transpose(0, 1).contiguous();
+      weight_.set_data(transposed);
+    }
   }
 
   if (bias_.defined()) {
@@ -1468,14 +1489,33 @@ torch::Tensor RowParallelLinearImpl::forward(torch::Tensor input) {
     if (!input_is_parallelized_) {
       input = xllm::parallel_state::scatter(input, process_group_);
     }
-    xllm::kernel::MatmulParams matmul_params;
-    matmul_params.a = input;
-    matmul_params.b = weight_;
-    matmul_params.bias = bias;
-    output = xllm::kernel::matmul(matmul_params);
+    if (world_size_ == 1) {
+      // Weight [in,out] after load transpose — same layout as main branch
+      if (bias_.defined()) {
+        auto sizes = input.sizes();
+        if (sizes.size() == 3) {
+          auto t = input.reshape({sizes[0] * sizes[1], sizes[2]});
+          output = torch::addmm(bias_, t, weight_)
+                       .reshape({sizes[0], sizes[1], weight_.size(1)});
+        } else {
+          output = torch::addmm(bias_, input, weight_);
+        }
+      } else {
+        output = torch::matmul(input, weight_);
+      }
+    } else {
+      xllm::kernel::MatmulParams matmul_params;
+      matmul_params.a = input;
+      matmul_params.b = weight_;
+      output = xllm::kernel::matmul(matmul_params);
+    }
   }
   if (enable_result_reduction_ && world_size_ > 1) {
     output = xllm::parallel_state::reduce(output, process_group_);
+  }
+  // Add bias AFTER reduce for row-parallel (matching main branch)
+  if (bias_.defined() && world_size_ > 1) {
+    output = output + bias_;
   }
   return output;
 }
@@ -1543,6 +1583,11 @@ void RowParallelLinearImpl::load_state_dict(const StateDict& state_dict) {
     }
   } else {
     LOAD_SHARDED_WEIGHT(weight, 1);
+    // Transpose weight from [out,in] to [in,out] matching main branch layout
+    if (world_size_ == 1 && weight_is_loaded_) {
+      auto transposed = weight_.data().transpose(0, 1).contiguous();
+      weight_.set_data(transposed);
+    }
   }
 
   if (bias_.defined()) {

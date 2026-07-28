@@ -347,15 +347,15 @@ class WanGELUImpl : public torch::nn::Module {
         options_(context.get_tensor_options()),
         parallel_args_(parallel_args) {
     quant_args_ = context.get_quant_args();
-    auto* tp_group = parallel_args_.dit_tp_group_;
-    proj_ = register_module("proj",
-                            layer::ColumnParallelLinear(dim_in,
-                                                        dim_out,
-                                                        with_bias,
-                                                        /*gather_output=*/false,
-                                                        quant_args_,
-                                                        tp_group,
-                                                        options_));
+    proj_ = register_module(
+        "proj",
+        layer::ColumnParallelLinear(dim_in,
+                                    dim_out,
+                                    with_bias,
+                                    /*gather_output=*/false,
+                                    quant_args_,
+                                    parallel_args_.dit_tp_group_,
+                                    options_));
   }
 
   torch::Tensor forward(const torch::Tensor& hidden_states_in) {
@@ -431,7 +431,6 @@ class WanFeedForwardImpl : public torch::nn::Module {
 
     dropout_ = register_module("dropout", torch::nn::Dropout(dropout));
 
-    auto* tp_group = parallel_args_.dit_tp_group_;
     proj_out_ = register_module(
         "proj_out",
         layer::RowParallelLinear(actual_inner_dim,
@@ -440,7 +439,7 @@ class WanFeedForwardImpl : public torch::nn::Module {
                                  /*input_is_parallelized=*/true,
                                  /*enable_result_reduction=*/true,
                                  quant_args_,
-                                 tp_group,
+                                 parallel_args_.dit_tp_group_,
                                  options_));
 
     if (final_dropout) {
@@ -558,7 +557,6 @@ class WanAttentionImpl : public torch::nn::Module {
         sparse_attn_config_(sparse_attn_config) {
     auto model_args = context.get_model_args();
     quant_args_ = context.get_quant_args();
-    auto* tp_group = parallel_args_.dit_tp_group_;
     dim_ = model_args.head_dim() * model_args.n_heads();
     heads_ = model_args.n_heads();
     dim_head_ = model_args.head_dim();
@@ -577,32 +575,35 @@ class WanAttentionImpl : public torch::nn::Module {
       kv_inner_dim_ = heads_ * dim_head_;
     }
     // Q/K: TP column only (SP handled in forward() due to norm ordering)
-    to_q_ = register_module("to_q",
-                            layer::ColumnParallelLinear(dim_,
-                                                        heads_ * dim_head_,
-                                                        true,
-                                                        /*gather_output=*/false,
-                                                        quant_args_,
-                                                        tp_group,
-                                                        options_));
-    to_k_ = register_module("to_k",
-                            layer::ColumnParallelLinear(dim_,
-                                                        kv_inner_dim_,
-                                                        true,
-                                                        /*gather_output=*/false,
-                                                        quant_args_,
-                                                        tp_group,
-                                                        options_));
+    to_q_ = register_module(
+        "to_q",
+        layer::ColumnParallelLinear(dim_,
+                                    heads_ * dim_head_,
+                                    true,
+                                    /*gather_output=*/false,
+                                    quant_args_,
+                                    parallel_args_.dit_tp_group_,
+                                    options_));
+    to_k_ = register_module(
+        "to_k",
+        layer::ColumnParallelLinear(dim_,
+                                    kv_inner_dim_,
+                                    true,
+                                    /*gather_output=*/false,
+                                    quant_args_,
+                                    parallel_args_.dit_tp_group_,
+                                    options_));
 
     // V: TP column only (SP all2all handled in forward())
-    to_v_ = register_module("to_v",
-                            layer::ColumnParallelLinear(dim_,
-                                                        kv_inner_dim_,
-                                                        true,
-                                                        /*gather_output=*/false,
-                                                        quant_args_,
-                                                        tp_group,
-                                                        options_));
+    to_v_ = register_module(
+        "to_v",
+        layer::ColumnParallelLinear(dim_,
+                                    kv_inner_dim_,
+                                    true,
+                                    /*gather_output=*/false,
+                                    quant_args_,
+                                    parallel_args_.dit_tp_group_,
+                                    options_));
 
     // to_out: TP row only (SP all2all handled in forward())
     to_out_ = register_module(
@@ -613,31 +614,31 @@ class WanAttentionImpl : public torch::nn::Module {
                                  /*input_is_parallelized=*/true,
                                  /*enable_result_reduction=*/true,
                                  quant_args_,
-                                 tp_group,
+                                 parallel_args_.dit_tp_group_,
                                  options_));
     norm_q_ = register_module(
         "norm_q", layer::RMSNorm(dim_head_ * heads_, eps_, options_));
     norm_k_ = register_module(
         "norm_k", layer::RMSNorm(dim_head_ * heads_, eps_, options_));
     if (added_kv_proj_dim_ > 0) {
-      add_k_proj_ =
-          register_module("add_k_proj",
-                          layer::ColumnParallelLinear(added_kv_proj_dim_,
-                                                      heads_ * dim_head_,
-                                                      true,
-                                                      /*gather_output=*/false,
-                                                      QuantArgs(),
-                                                      tp_group,
-                                                      options_));
-      add_v_proj_ =
-          register_module("add_v_proj",
-                          layer::ColumnParallelLinear(added_kv_proj_dim_,
-                                                      heads_ * dim_head_,
-                                                      true,
-                                                      /*gather_output=*/false,
-                                                      QuantArgs(),
-                                                      tp_group,
-                                                      options_));
+      add_k_proj_ = register_module(
+          "add_k_proj",
+          layer::ColumnParallelLinear(added_kv_proj_dim_,
+                                      heads_ * dim_head_,
+                                      true,
+                                      /*gather_output=*/false,
+                                      QuantArgs(),
+                                      parallel_args_.dit_tp_group_,
+                                      options_));
+      add_v_proj_ = register_module(
+          "add_v_proj",
+          layer::ColumnParallelLinear(added_kv_proj_dim_,
+                                      heads_ * dim_head_,
+                                      true,
+                                      /*gather_output=*/false,
+                                      QuantArgs(),
+                                      parallel_args_.dit_tp_group_,
+                                      options_));
       norm_added_k_ = register_module(
           "norm_added_k", layer::RMSNorm(dim_head_ * heads_, eps_, options_));
     }

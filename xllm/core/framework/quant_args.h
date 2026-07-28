@@ -112,8 +112,6 @@ struct QuantArgs {
 
   // ── Convenience helpers for weight-loading prefix resolution ──────────
 
-  bool is_quantized() const { return !quant_descs_.empty(); }
-
   // ── Module-level helpers ────────────────────────────────────────────────
 
   bool should_ignore_module(const std::string& module_name) const {
